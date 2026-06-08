@@ -1,0 +1,78 @@
+# Copyright 2025, Sirius Contributors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: build
+
+# Build/link validation only. CI has no Mellanox NIC and no GPU, so the RDMA data
+# path cannot run here (the same build-only constraint as any non-RDMA host). cuObject/cuFile are
+# NVIDIA-proprietary and gated, so they are fetched only when the optional repo
+# secrets CUOBJ_SDK_URL / CUFILE_URL are configured; otherwise the SDK-dependent
+# compile step is skipped and CI validates the pixi env + non-SDK pieces.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          run-install: true
+
+      - name: Check the NVIDIA SDK is available
+        id: sdk
+        env:
+          CUOBJ_SDK_URL: ${{ secrets.CUOBJ_SDK_URL }}
+          CUFILE_URL: ${{ secrets.CUFILE_URL }}
+        run: |
+          if [ -n "${CUOBJ_SDK_URL}" ] && [ -n "${CUFILE_URL}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CUOBJ_SDK_URL/CUFILE_URL secrets not set — skipping SDK-dependent build."
+          fi
+
+      - name: Fetch pinned NVIDIA SDKs
+        if: steps.sdk.outputs.available == 'true'
+        env:
+          CUOBJ_SDK_URL: ${{ secrets.CUOBJ_SDK_URL }}
+          CUFILE_URL: ${{ secrets.CUFILE_URL }}
+          CUOBJ_SDK_SHA256: ${{ secrets.CUOBJ_SDK_SHA256 }}
+          CUFILE_SHA256: ${{ secrets.CUFILE_SHA256 }}
+        run: pixi run fetch-sdk
+
+      - name: Build (client + server)
+        if: steps.sdk.outputs.available == 'true'
+        run: pixi run build
+
+      - name: Check glibc baseline
+        if: steps.sdk.outputs.available == 'true'
+        run: pixi run check-glibc
+
+      - name: Validate config (no SDK)
+        if: steps.sdk.outputs.available != 'true'
+        run: |
+          # Without the gated SDK we can still sanity-check the toolchain wiring.
+          pixi run bash -c 'cmake --version && ninja --version'
+          bash -n scripts/fetch_sdk.sh
+          bash -n scripts/configure.sh
+          bash -n scripts/bundle.sh
+          echo "SDK secrets absent — full compile skipped (expected on forks)."

@@ -1,0 +1,35 @@
+# Build / environment artifacts
+build/
+dist/
+.pixi/
+
+# Generated test data (recreate with: pixi run gen-data)
+data/
+
+# Vendored NVIDIA SDKs are NOT committed — fetched at build time into third_party/
+# (see third_party/README.md). Keep the directory, ignore everything fetched.
+third_party/*
+!third_party/.gitkeep
+!third_party/README.md
+!third_party/versions.env
+
+# Private / machine-local conventions — never upload (see the file header)
+CLAUDE.md
+CLAUDE.local.md
+# Internal AI/agent working conventions — kept local, not published
+AGENTS.md
+
+# Editor / IDE
+.vscode/
+.idea/
+cmake-build-debug/
+cmake-build-release/
+.clangd/
+compile_commands.json
+
+# Runtime / logs
+cufile.log
+*.log
+
+# OS cruft
+.DS_Store

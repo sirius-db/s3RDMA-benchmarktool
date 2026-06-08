@@ -1,0 +1,81 @@
+# Copyright 2025, Sirius Contributors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[workspace]
+name = "s3RDMA-benchmarktool"
+version = "0.1.0"
+description = "S3-style object GET over RDMA using NVIDIA cuObject (cuObjClient / cuObjServer)"
+authors = ["Sirius Contributors"]
+channels = ["https://prefix.dev/conda-forge"]
+platforms = ["linux-64"]
+
+# --------------------------------------------------------------------------
+# Dependencies that Pixi can manage from conda-forge.
+# NOTE: the cuObject SDK, RDMA driver stack (MLNX_OFED / libibverbs at runtime),
+# and GPUDirect Storage (cufile / nvidia-fs) are NOT on conda-forge. They are
+# installed at the SYSTEM level and referenced by CMake. See doc/design.md §7.
+# --------------------------------------------------------------------------
+[dependencies]
+cxx-compiler = ">=1.7"      # provides g++ / gcc toolchain (uses conda sysroot, NOT host glibc)
+# Pin the target glibc baseline so binaries built on a newer host like Ubuntu 24.04 (glibc 2.39)
+# still run on older glibc distros (e.g. glibc 2.31). glibc is backward-
+# compatible only, so we target an OLD baseline. 2.17 is the most portable.
+sysroot_linux-64 = "2.17.*"
+cmake = ">=3.22"
+ninja = ">=1.11"
+pkg-config = ">=0.29"
+# CUDA headers/libs for building (match the cluster's CUDA major version).
+# Comment out if you prefer to use the system CUDA toolkit instead.
+cuda-toolkit = ">=13.0"
+# Header-only HTTP library for the fake S3 control path (server endpoint +
+# client HTTP call inside the cuObject get/put callback). See doc/design.md.
+cpp-httplib = ">=0.15"
+# RDMA userspace stack (libibverbs / librdmacm) for linking the cuObject libs on
+# hosts where there is no sudo to install the system packages. See doc/design.md.
+rdma-core = ">=50"
+# OpenSSL (libcrypto) for SHA256 verification of fetched objects (matches the
+# `sha256sum` checksums printed by scripts/gen_testdata.sh).
+openssl = ">=3.0"
+# Deploy tooling (push bundles to the test nodes over ssh).
+sshpass = ">=1.06"
+rsync = ">=3.2"
+
+[tasks]
+# Fetch the pinned NVIDIA SDKs (cuObject + matched cuFile) into third_party/.
+# These are NOT vendored in git — they are downloaded at build time. Run this
+# once before `configure`/`build` unless you use a system cuObject install or set
+# CUOBJ_SDK_ROOT. See third_party/README.md.
+fetch-sdk = "bash scripts/fetch_sdk.sh"
+# Configure the build (out-of-source in ./build). Builds against the
+# version-aligned cuObject 1.0.0 SDK if unpacked under third_party/ (run
+# `pixi run fetch-sdk`, or set CUOBJ_SDK_ROOT), else the system install. See doc/test.md.
+configure = "bash scripts/configure.sh"
+# Compile everything
+build = { cmd = "cmake --build build", depends-on = ["configure"] }
+# Clean build artifacts
+clean = "rm -rf build"
+# Verify the built binaries' max required GLIBC symbol (must be <= target, e.g. 2.31 for older glibc distros)
+check-glibc = "bash scripts/check_glibc.sh"
+# Generate sample test data
+gen-data = "bash scripts/gen_testdata.sh"
+# Run the demo across the deployed nodes (RDMA). Needs the test nodes — see doc/test.md.
+demo = "bash scripts/run_demo.sh"
+
+# ----- deployment to the test nodes (see doc/test.md) ---------------------
+# Bundle binaries + the cuObject/cufile libs not present on the nodes.
+bundle = { cmd = "bash scripts/bundle.sh", depends-on = ["build"] }
+# Push bundles over ssh (sshpass). Node coords set via env (see scripts/deploy.sh).
+deploy-server = { cmd = "bash scripts/deploy.sh server", depends-on = ["bundle"] }
+deploy-client = { cmd = "bash scripts/deploy.sh client", depends-on = ["bundle"] }
+deploy = { depends-on = ["deploy-server", "deploy-client"] }
