@@ -65,8 +65,8 @@ class S3Server {
   // Handle one GET (full or range). Acquires a slot, transfers data in
   // chunk-sized ping-pong steps (pread + RDMA_WRITE overlapped), releases slot.
   int handle_get(const std::string& key, const std::string& range_hdr,
-                 const std::string& rdma_token_b64, uint64_t remote_addr,
-                 size_t req_chunk, ssize_t& bytes_out);
+                 const std::string& rdma_token_b64,
+                 ssize_t& bytes_out);
 
   // --- Slot pool (dynamic) ---
   RdmaSlot create_slot();              // allocate channel + 2 staging buffers

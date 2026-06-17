@@ -55,7 +55,7 @@ struct Args {
   std::vector<std::string> objects;  // one or more object keys
   int threads = 1;
   int duration = 10;  // seconds
-  size_t chunk_size = 0;  // 0 = server default
+  size_t range_size = 0;  // 0 = full object; >0 = range read of this many bytes
 };
 
 void print_usage(const char* argv0) {
@@ -68,7 +68,7 @@ void print_usage(const char* argv0) {
       "  --mode <host|gpu>     Destination buffer memory type (default: host)\n"
       "  --threads <N>         Concurrent GET threads (default: 1)\n"
       "  --duration <secs>     Sustained benchmark duration (default: 10)\n"
-      "  --chunk-size <KiB>    Per-chunk RDMA write size sent to server (default: server)\n"
+      "  --range-size <size>   Range-read size per GET, e.g. 1m, 16m (default: full object)\n"
       "  --out <path>          Dump last GET to file (single-thread only)\n"
       "  -h, --help            Show this help\n",
       argv0);
@@ -84,25 +84,34 @@ std::vector<std::string> split_csv(const std::string& s) {
   return out;
 }
 
-bool parse_int(const std::string& s, int& out) {
+// Parse a size string like "4m", "16M", "1024k", "1048576" into bytes.
+bool parse_size(const std::string& s, size_t& out) {
+  if (s.empty()) return false;
   try {
     size_t pos = 0;
-    long v = std::stol(s, &pos);
-    if (pos != s.size() || v < 0 || v > std::numeric_limits<int>::max()) return false;
-    out = static_cast<int>(v);
+    unsigned long long v = std::stoull(s, &pos);
+    if (pos < s.size()) {
+      char suffix = std::tolower(s[pos]);
+      if (suffix == 'k') v *= 1024ULL;
+      else if (suffix == 'm') v *= 1024ULL * 1024ULL;
+      else if (suffix == 'g') v *= 1024ULL * 1024ULL * 1024ULL;
+      else return false;
+      ++pos;
+    }
+    if (pos != s.size() || v == 0) return false;
+    out = static_cast<size_t>(v);
     return true;
   } catch (...) {
     return false;
   }
 }
 
-bool parse_size_kib(const std::string& s, size_t& out) {
+bool parse_int(const std::string& s, int& out) {
   try {
     size_t pos = 0;
-    unsigned long long v = std::stoull(s, &pos);
-    if (pos != s.size() || v == 0) return false;
-    if (v > std::numeric_limits<size_t>::max() / 1024ULL) return false;
-    out = static_cast<size_t>(v) * 1024ULL;
+    long v = std::stol(s, &pos);
+    if (pos != s.size() || v < 0 || v > std::numeric_limits<int>::max()) return false;
+    out = static_cast<int>(v);
     return true;
   } catch (...) {
     return false;
@@ -175,9 +184,9 @@ bool parse_args(int argc, char** argv, Args& out) {
         return false;
       }
     }
-    else if (a == "--chunk-size") {
-      if (!parse_size_kib(next("--chunk-size"), out.chunk_size)) {
-        LOG_ERROR("--chunk-size must be a positive integer KiB value");
+    else if (a == "--range-size") {
+      if (!parse_size(next("--range-size"), out.range_size)) {
+        LOG_ERROR("--range-size must be a positive size (e.g. 1m, 16m)");
         return false;
       }
     }
@@ -215,7 +224,7 @@ std::tuple<std::vector<ThreadResult>,
            std::vector<std::unique_ptr<s3rdma::S3Client>>,
            double>
 setup_buffers_clients(s3rdma::BufferMode mode, size_t max_size, int N,
-                      const std::string& host, int port, size_t chunk_size,
+                      const std::string& host, int port,
                       const std::string& mode_str) {
   std::vector<ThreadResult> results(N);
   std::vector<std::unique_ptr<s3rdma::Buffer>> bufs(N);
@@ -224,7 +233,7 @@ setup_buffers_clients(s3rdma::BufferMode mode, size_t max_size, int N,
   auto alloc_t0 = std::chrono::steady_clock::now();
   for (int t = 0; t < N; ++t) {
     bufs[t] = std::make_unique<s3rdma::Buffer>(mode, max_size);
-    clients[t] = std::make_unique<s3rdma::S3Client>(host, port, chunk_size);
+    clients[t] = std::make_unique<s3rdma::S3Client>(host, port);
     clients[t]->register_buffer(bufs[t]->data(), max_size);
   }
   auto alloc_t1 = std::chrono::steady_clock::now();
@@ -241,7 +250,7 @@ double run_benchmark(std::vector<std::unique_ptr<s3rdma::S3Client>>& clients,
                      const std::vector<ObjDesc>& objs,
                      const std::string& bucket,
                      std::vector<ThreadResult>& results,
-                     int N, int dur_secs) {
+                     int N, int dur_secs, size_t range_size) {
   const size_t num_objs = objs.size();
   std::atomic<int> ready{0};
   std::atomic<bool> go{false};
@@ -257,8 +266,12 @@ double run_benchmark(std::vector<std::unique_ptr<s3rdma::S3Client>>& clients,
 
     while (!stop.load(std::memory_order_relaxed)) {
       auto& obj = objs[iter % num_objs];
-      ssize_t n = clients[tid]->get_registered(bufs[tid]->data(), obj.size,
-                                                bucket, obj.key, "");
+      size_t xfer_size = (range_size > 0) ? std::min(range_size, obj.size) : obj.size;
+      std::string range_hdr;
+      if (range_size > 0)
+        range_hdr = "bytes=0-" + std::to_string(xfer_size - 1);
+      ssize_t n = clients[tid]->get_registered(bufs[tid]->data(), xfer_size,
+                                                bucket, obj.key, range_hdr);
       if (n < 0) { r.ok = false; break; }
       r.total_bytes += n;
       r.iters = ++iter;
@@ -340,14 +353,22 @@ int main(int argc, char** argv) {
 
   auto [results, bufs, clients, alloc_ms] =
       setup_buffers_clients(mode, max_size, N, args.host, args.port,
-                            args.chunk_size, args.mode);
+                            args.mode);
+
+  const size_t range_size = args.range_size;
+  if (range_size > 0)
+    LOG_INFO("range-read mode: %zu KiB per GET", range_size / 1024);
 
   // Warm-up: one GET per object to prime server page cache.
-  for (size_t i = 0; i < num_objs; ++i)
-    clients[0]->get_registered(bufs[0]->data(), objs[i].size,
-                                args.bucket, objs[i].key, "");
+  for (size_t i = 0; i < num_objs; ++i) {
+    size_t wsz = (range_size > 0) ? std::min(range_size, objs[i].size) : objs[i].size;
+    std::string whdr;
+    if (range_size > 0) whdr = "bytes=0-" + std::to_string(wsz - 1);
+    clients[0]->get_registered(bufs[0]->data(), wsz,
+                                args.bucket, objs[i].key, whdr);
+  }
 
-  double wall_secs = run_benchmark(clients, bufs, objs, args.bucket, results, N, dur_secs);
+  double wall_secs = run_benchmark(clients, bufs, objs, args.bucket, results, N, dur_secs, range_size);
   report_results(results, wall_secs, N, args.mode, num_objs);
   cleanup(clients, bufs, N);
 

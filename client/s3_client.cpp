@@ -16,9 +16,6 @@
 
 #include "s3_client.hpp"
 
-#include <cstdint>
-#include <limits>
-
 #include <httplib.h>
 
 #include "base64.hpp"
@@ -28,20 +25,6 @@
 namespace s3rdma {
 
 namespace {
-
-ssize_t parse_ssize_header(const std::string& v, ssize_t fallback) {
-  try {
-    size_t pos = 0;
-    unsigned long long parsed = std::stoull(v, &pos);
-    if (pos != v.size() ||
-        parsed > static_cast<unsigned long long>(std::numeric_limits<ssize_t>::max())) {
-      return fallback;
-    }
-    return static_cast<ssize_t>(parsed);
-  } catch (...) {
-    return fallback;
-  }
-}
 
 // cuObject GET callback. Runs the fake-S3 control-path HTTP request: it encodes
 // the RDMA descriptor into a header and asks the server to RDMA_WRITE into our
@@ -56,12 +39,8 @@ ssize_t get_callback(const void* handle, char* ptr, size_t size, loff_t offset,
 
   httplib::Headers headers = {
       {kHdrRdmaToken, base64_encode(rdma->desc_str, rdma->desc_len)},
-      {kHdrRemoteAddr, std::to_string(reinterpret_cast<uintptr_t>(ptr))},
-      {kHdrSize, std::to_string(size)},
   };
   if (!ctx->range.empty()) headers.emplace("Range", ctx->range);
-  if (ctx->chunk_size > 0)
-    headers.emplace(kHdrChunkSize, std::to_string(ctx->chunk_size));
 
   httplib::Client cli(ctx->host, ctx->port);
   auto res = cli.Get(ctx->path, headers);
@@ -74,17 +53,14 @@ ssize_t get_callback(const void* handle, char* ptr, size_t size, loff_t offset,
     LOG_ERROR("HTTP GET %s -> %d", ctx->path.c_str(), res->status);
     return -1;
   }
-  ssize_t bytes = size;
-  if (res->has_header(kHdrBytes))
-    bytes = parse_ssize_header(res->get_header_value(kHdrBytes), bytes);
   (void)offset;
-  return bytes;
+  return static_cast<ssize_t>(size);
 }
 
 }  // namespace
 
-S3Client::S3Client(std::string host, int port, size_t chunk_size)
-    : host_(std::move(host)), port_(port), chunk_size_(chunk_size) {
+S3Client::S3Client(std::string host, int port)
+    : host_(std::move(host)), port_(port) {
   ops_.get = &get_callback;
   ops_.put = nullptr;  // GET-only demo
   // NOTE: opens the cuFile RDMA path — requires GDS + Mellanox NIC.
@@ -102,7 +78,6 @@ ssize_t S3Client::get(void* ptr, size_t size, const std::string& bucket,
   ctx.port = port_;
   ctx.path = "/" + bucket + "/" + object;
   ctx.range = range;
-  ctx.chunk_size = chunk_size_;
 
   ssize_t n = -1;
   try {
@@ -132,7 +107,6 @@ ssize_t S3Client::get_registered(void* ptr, size_t size,
   ctx.port = port_;
   ctx.path = "/" + bucket + "/" + object;
   ctx.range = range;
-  ctx.chunk_size = chunk_size_;
 
   ssize_t n = -1;
   try {

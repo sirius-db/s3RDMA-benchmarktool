@@ -36,12 +36,11 @@ struct GetContext {
   int port = 8080;
   std::string path;    // "/<bucket>/<object>"
   std::string range;   // "bytes=a-b" or empty
-  size_t chunk_size = 0;  // 0 = server default
 };
 
 class S3Client {
  public:
-  S3Client(std::string host, int port, size_t chunk_size = 0);
+  S3Client(std::string host, int port);
   ~S3Client();
 
   // Register buffer, perform GET (full if range empty), deregister.
@@ -60,7 +59,6 @@ class S3Client {
  private:
   std::string host_;
   int port_;
-  size_t chunk_size_ = 0;  // 0 = server default
   CUObjOps_t ops_{};
   cuObjClient* client_ = nullptr;
 };

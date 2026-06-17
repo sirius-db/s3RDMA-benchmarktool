@@ -14,7 +14,7 @@ object bytes into the client's registered buffer.
                  HTTP control path (cpp-httplib)
    client  ──── GET /bucket/object ───────────────►  server
  (cuObjClient)   x-amz-rdma-token: <RDMA desc>       (cuObjServer)
-              ◄── 200/206  x-amz-rdma-bytes-transferred ──
+              ◄── 200/206  x-amz-rdma-reply: 200   ──
        ▲                                                    │
        └──────────── RDMA_WRITE (data path) ◄───────────────┘
    host / GPU buffer                          ./data/<bucket>/<object>
