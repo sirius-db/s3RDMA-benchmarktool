@@ -24,11 +24,24 @@
 namespace s3rdma {
 
 // HTTP header names exchanged on the control path (see doc/design.md).
+// Only standard cuObject headers are used — see
+// https://docs.nvidia.com/gpudirect-storage/cuobject/index.html
 inline constexpr const char* kHdrRdmaToken = "x-amz-rdma-token";   // base64 desc_str
-inline constexpr const char* kHdrRemoteAddr = "x-cuobj-remote-addr";  // client buffer addr
-inline constexpr const char* kHdrSize = "x-cuobj-size";            // transfer size
-inline constexpr const char* kHdrBytes = "x-amz-rdma-bytes-transferred";
-inline constexpr const char* kHdrChunkSize = "x-cuobj-chunk-size";     // client-requested chunk
+inline constexpr const char* kHdrRdmaReply = "x-amz-rdma-reply";   // RDMA status ("200" = OK)
+
+// Parse the remote buffer base address from a decoded RDMA descriptor.
+// DC_V1 format: "buf_address:buf_size:rkey:lid:dctn:rocev2_flag:gid"
+// (all fields hex except rocev2_flag which is decimal).
+// Returns 0 on parse failure.
+inline uint64_t parse_rdma_remote_addr(const std::string& rdma_descr) {
+  auto colon = rdma_descr.find(':');
+  if (colon == std::string::npos || colon == 0) return 0;
+  try {
+    return std::stoull(rdma_descr.substr(0, colon), nullptr, 16);
+  } catch (...) {
+    return 0;
+  }
+}
 
 // Parsed "/<bucket>/<object>" request path.
 struct ObjectPath {

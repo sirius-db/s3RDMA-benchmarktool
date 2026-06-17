@@ -19,7 +19,6 @@
 #include <cerrno>
 #include <cstring>
 #include <iostream>
-#include <limits>
 #include <string>
 #include <thread>
 
@@ -40,28 +39,6 @@ constexpr size_t kAlign = 4096;  // O_DIRECT alignment (filesystem block size)
 
 inline uint64_t align_down(uint64_t v, uint64_t a) { return v & ~(a - 1); }
 inline uint64_t align_up(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
-
-bool parse_u64_strict(const std::string& s, uint64_t& out) {
-  try {
-    size_t pos = 0;
-    unsigned long long v = std::stoull(s, &pos);
-    if (pos != s.size()) return false;
-    out = static_cast<uint64_t>(v);
-    return true;
-  } catch (...) {
-    return false;
-  }
-}
-
-bool parse_size_strict(const std::string& s, size_t& out) {
-  uint64_t v = 0;
-  if (!parse_u64_strict(s, v) ||
-      v > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
-    return false;
-  }
-  out = static_cast<size_t>(v);
-  return true;
-}
 
 // Full pread that retries on short reads (required for O_DIRECT with large sizes).
 ssize_t pread_full(int fd, void* buf, size_t count, off_t offset) {
@@ -235,8 +212,8 @@ int S3Server::get_fd(const std::string& path, uint64_t& file_size) {
 // ---------------------------------------------------------------------------
 
 int S3Server::handle_get(const std::string& key, const std::string& range_hdr,
-                         const std::string& rdma_token_b64, uint64_t remote_addr,
-                         size_t req_chunk, ssize_t& bytes_out) {
+                         const std::string& rdma_token_b64,
+                         ssize_t& bytes_out) {
   const std::string path = cfg_.data_dir + "/" + key;
 
   uint64_t file_size = 0;
@@ -261,9 +238,17 @@ int S3Server::handle_get(const std::string& key, const std::string& range_hdr,
   }
 
   const std::string rdma_descr = base64_decode(rdma_token_b64);
+
+  // Extract the remote buffer base address from the RDMA descriptor.
+  uint64_t remote_base = parse_rdma_remote_addr(rdma_descr);
+  if (remote_base == 0) {
+    LOG_ERROR("failed to parse remote address from RDMA descriptor");
+    return 500;
+  }
+
   RdmaSlot slot = acquire_slot();
 
-  const size_t chunk = std::min(req_chunk, cfg_.chunk_size);
+  const size_t chunk = cfg_.chunk_size;
   if (chunk == 0) {
     LOG_ERROR("invalid zero chunk size");
     release_slot(slot);
@@ -271,7 +256,7 @@ int S3Server::handle_get(const std::string& key, const std::string& range_hdr,
   }
   uint64_t remaining = length;
   uint64_t file_off = offset;
-  uint64_t remote_off = remote_addr;
+  uint64_t remote_off = remote_base;
   ssize_t total_written = 0;
 
   // Prefill buf[0] with first chunk.
@@ -379,34 +364,14 @@ void S3Server::run() {
       res.set_content("missing RDMA token header\n", "text/plain");
       return;
     }
-    uint64_t remote_addr = 0;
-    if (!req.has_header(kHdrRemoteAddr) ||
-        !parse_u64_strict(req.get_header_value(kHdrRemoteAddr), remote_addr)) {
-      res.status = 400;
-      res.set_content("invalid remote address header\n", "text/plain");
-      return;
-    }
-
-    // Client-requested chunk size (capped by server's staging buffer).
-    size_t req_chunk = cfg_.chunk_size;
-    if (req.has_header(kHdrChunkSize)) {
-      size_t parsed_chunk = 0;
-      if (!parse_size_strict(req.get_header_value(kHdrChunkSize), parsed_chunk) ||
-          parsed_chunk == 0) {
-        res.status = 400;
-        res.set_content("invalid chunk size header\n", "text/plain");
-        return;
-      }
-      req_chunk = std::min(parsed_chunk, cfg_.chunk_size);
-    }
 
     const std::string key = p.bucket + "/" + p.object;
     ssize_t bytes = 0;
     int status = handle_get(key, req.get_header_value("Range"), token,
-                            remote_addr, req_chunk, bytes);
+                            bytes);
     res.status = status;
     if (status == 200 || status == 206) {
-      res.set_header(kHdrBytes, std::to_string(bytes));
+      res.set_header(kHdrRdmaReply, "200");
       res.set_content("OK\n", "text/plain");
     } else {
       res.set_content("error\n", "text/plain");

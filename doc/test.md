@@ -50,42 +50,87 @@ Server — dynamic slot allocation (up to 1024), 2 MiB double-buffer ping-pong:
 
 Client — `run.sh` sets `LD_LIBRARY_PATH` for the bundled libs.
 
-## Results — sustained benchmark
+## Results — large read (128 MiB object)
 
-10 s, page cache warm, 2 MiB chunks, double-buffer ping-pong.
+Single 128 MiB object, thread count varies. Determines how many threads are
+needed to saturate the link. 10 s, page cache warm, 2 MiB server chunks,
+double-buffer ping-pong.
 
-**Workload:** 11 objects round-robin (8×8 MiB + 2×64 MiB + 1×128 MiB).
-Each thread registers one **128 MiB** buffer and loops GETs for 10 s.
-Client NIC: CX-6 100G. Server NIC: bonded 2×100G.
-
-```bash
-OBJS=obj-8m-0.bin,obj-8m-1.bin,obj-8m-2.bin,obj-8m-3.bin,obj-8m-4.bin,obj-8m-5.bin,obj-8m-6.bin,obj-8m-7.bin,obj-64m-0.bin,obj-64m-1.bin,obj-128m-0.bin
-```
-
-Buffer per thread: **128 MiB** (= largest object).
+Client NIC: CX-6 100G (single). Server NIC: bonded 2×100G.
 Host = `cudaMallocHost` (pinned). GPU = `cudaMalloc` (GPUDirect RDMA).
 
 ```bash
-./run.sh --server <SERVER>:8080 --bucket demo-bucket --objects $OBJS --mode host --threads N --duration 10
-./run.sh --server <SERVER>:8080 --bucket demo-bucket --objects $OBJS --mode gpu  --threads N --duration 10
+./run.sh --server <SERVER>:8080 --bucket demo-bucket --object obj-128m-0.bin --mode host --threads N --duration 10
+./run.sh --server <SERVER>:8080 --bucket demo-bucket --object obj-128m-0.bin --mode gpu  --threads N --duration 10
 ```
 
-| Threads | Buf (N × MiB) | Host Alloc+Reg (ms) | Host BW (GiB/s) | Host Gbps | GPU Alloc+Reg (ms) | GPU BW (GiB/s) | GPU Gbps |
-|---------|--------------|--------------------:|----------------:|----------:|-------------------:|---------------:|---------:|
-| 1 | 1 × 128 | 724 | 5.9 | 47.6 | 646 | 6.8 | 54.6 |
-| 2 | 2 × 128 | 707 | 9.9 | **79.4** | 651 | 10.0 | **80.2** |
-| 8 | 8 × 128 | 1092 | 11.3 | **90.7** | 669 | 11.3 | **90.7** |
-| 32 | 32 × 128 | 2576 | 11.3 | **90.8** | 895 | 11.3 | **90.8** |
+| Threads | Host Alloc+Reg (ms) | Host Gbps | GPU Alloc+Reg (ms) | GPU Gbps |
+|---------|--------------------:|----------:|-------------------:|---------:|
+| 1 | 678 | 64.4 | 653 | 63.4 |
+| 2 | 742 | 85.2 | 672 | 85.2 |
+| 4 | 913 | **90.4** | 746 | **90.6** |
+| 8 | 1098 | **90.8** | 816 | **90.8** |
+| 16 | 1279 | **90.7** | 857 | **90.8** |
+| 32 | 2542 | **90.8** | 924 | **90.8** |
+| 64 | 3135 | **90.8** | 1355 | **90.8** |
+| 128 | 5905 | **90.8** | 1975 | **90.7** |
 
-### Error handling
+**Peak: ~91 Gbps at 4 threads** (~91% line rate on 100G). Host and GPU modes
+match. Adding threads beyond 4 does not improve throughput for large objects.
 
-| Test | Expected |
-|------|----------|
-| PUT / POST | `405` |
-| HEAD/GET missing object | `404` |
+## Results — range-read sweep (128 MiB object)
 
-**Peak: ~91 Gbps at 8+ threads** (~91% line rate on 100G). Host and GPU modes
-match. Alloc+register is a one-time cost (~650 ms for 1×128 MiB).
+Single 128 MiB object, `--range-size` varies. High thread counts (32/64/128)
+to eliminate control-plane serialization. Determines the minimum range size
+that saturates the link.
+
+```bash
+./run.sh --server <SERVER>:8080 --bucket demo-bucket --object obj-128m-0.bin --mode host --threads N --duration 10 --range-size <SIZE>
+```
+
+### Host mode (Gbps)
+
+| Range size | 4 threads | 8 threads | 16 threads | 32 threads | 64 threads | 128 threads |
+|-----------|----------:|----------:|----------:|----------:|----------:|----------:|
+| 256 KiB | 16.5 | 34.3 | 66.6 | 82.6 | 81.5 | 65.7 |
+| 512 KiB | 27.9 | 55.6 | 85.3 | **90.7** | 87.8 | 83.5 |
+| 1 MiB | 46.3 | 78.5 | **90.7** | 88.7 | 85.0 | **90.7** |
+| 2 MiB | 66.9 | 89.5 | **90.8** | **90.8** | **90.8** | **90.8** |
+| 4 MiB | 83.2 | **90.7** | **90.7** | **90.7** | **90.8** | **90.8** |
+| 8 MiB | 88.6 | **90.7** | **90.8** | **90.8** | **90.8** | **90.8** |
+| 16 MiB | 88.3 | **90.7** | **90.7** | **90.8** | **90.7** | **90.7** |
+| 32 MiB | 90.2 | **90.8** | **90.7** | **90.8** | **90.8** | **90.7** |
+| 64 MiB | 90.3 | **90.7** | **90.7** | **90.8** | **90.8** | **90.8** |
+| 128 MiB (full) | 90.5 | **90.8** | 90.6 | **90.8** | **90.8** | **90.8** |
+
+### GPU mode (Gbps)
+
+| Range size | 4 threads | 8 threads | 16 threads | 32 threads | 64 threads | 128 threads |
+|-----------|----------:|----------:|----------:|----------:|----------:|----------:|
+| 256 KiB | 17.5 | 34.9 | 67.0 | 89.3 | **90.8** | 67.4 |
+| 512 KiB | 27.9 | 50.9 | 84.6 | **90.6** | **90.8** | 71.3 |
+| 1 MiB | 48.9 | 80.1 | **90.7** | **90.7** | **90.8** | **90.7** |
+| 2 MiB | 70.2 | 89.9 | **90.8** | **90.8** | **90.8** | **90.7** |
+| 4 MiB | 85.0 | **90.8** | **90.7** | **90.7** | **90.8** | **90.8** |
+| 8 MiB | 89.7 | **90.8** | **90.8** | **90.7** | **90.8** | **90.8** |
+| 16 MiB | 90.1 | **90.8** | **90.8** | **90.8** | **90.7** | **90.7** |
+| 32 MiB | 90.3 | **90.8** | **90.8** | **90.8** | **90.8** | **90.8** |
+| 64 MiB | 90.5 | **90.8** | **90.8** | **90.8** | **90.8** | **90.8** |
+| 128 MiB (full) | 90.6 | **90.8** | **90.8** | **90.8** | **90.8** | **90.8** |
+
+**Key findings:**
+
+- **4 threads:** BW scales linearly with range size; 8 MiB reaches ~89 Gbps
+  but doesn't fully saturate — HTTP round-trip is the bottleneck with only 4
+  concurrent requests.
+- **8 threads:** 4 MiB range hits line rate (~90.7 Gbps). Doubling concurrency
+  halves the minimum range needed vs 4 threads.
+- **16 threads:** 1 MiB range is enough to saturate the link.
+- **32+ threads:** 512 KiB–2 MiB ranges reach line rate. At 128 threads,
+  thread scheduling overhead pushes the minimum to 1 MiB.
+- **Overall:** the minimum range size for max BW is inversely proportional to
+  thread count. **8 threads × 4 MiB** or **16 threads × 1 MiB** are practical
+  sweet spots for both host and GPU modes.
 
 ## Troubleshooting notes (root causes hit during bring-up)
 

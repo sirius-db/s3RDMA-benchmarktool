@@ -25,16 +25,16 @@ A single full GET, with the real function and header names:
         └─ get_callback(handle, ptr, size, …, rdma)   ← cuObject calls this ONCE
              base64(rdma->desc_str) ─┐
              HTTP GET /bucket/object │
-               x-amz-rdma-token: <descriptor>
-               x-cuobj-remote-addr: <ptr>      ──────►  run() httplib handler
-               x-cuobj-size: <size>                       parse_object_path()
-               (Range: bytes=a-b)                         get_fd()  → fd + size
+               x-amz-rdma-token: <descriptor>  ──────►  run() httplib handler
+               (Range: bytes=a-b)                         parse_object_path()
+                                                          get_fd()  → fd + size
                                                           handle_get():
+                                                            parse_rdma_remote_addr()
                                                             acquire_slot()
                                               ◄─ RDMA_WRITE ─  ping-pong loop:
         buf filled by RDMA  ◄───────────────────────────       pread → handleGetObject
-             ◄── 200/206  x-amz-rdma-bytes-transferred ──      release_slot()
-        return bytes  ◄──┘
+             ◄── 200/206  x-amz-rdma-reply: 200       ──      release_slot()
+        return size   ◄──┘
 ```
 
 ## The key insight: one callback, server-side chunking
@@ -95,10 +95,10 @@ the client (see [Doc-vs-code discrepancies](#doc-vs-code-discrepancies)).
   of the control plane. It recovers the per-request `GetContext` via
   `cuObjClient::getCtx(handle)`, builds the headers (constants from
   [common/s3_util.hpp](../common/s3_util.hpp)) — base64-encoding `rdma->desc_str`
-  into `x-amz-rdma-token`, the buffer pointer into `x-cuobj-remote-addr`, the size
-  into `x-cuobj-size`, plus optional `Range` and `x-cuobj-chunk-size` — issues the
-  HTTP GET, accepts only `200`/`206`, and returns the server-reported
-  `x-amz-rdma-bytes-transferred` (falling back to `size`).
+  into `x-amz-rdma-token`, plus an optional `Range` header — issues the
+  HTTP GET, accepts only `200`/`206`, and returns `size`. Only standard
+  cuObject headers are used; the server extracts the remote buffer address
+  from the RDMA descriptor.
 
 ### [client/buffers.cpp](../client/buffers.cpp) — host vs GPU memory
 
@@ -118,10 +118,10 @@ and a plain `memcpy` for host buffers, used only by the `--out` dump.
 
 - parses the path with `parse_object_path`; bad paths → `400`.
 - serves `HEAD` directly from `get_fd` (returns `Content-Length`, or `404`).
-- for GET, validates the `x-amz-rdma-token` and `x-cuobj-remote-addr` headers
-  (→ `400` if missing/invalid), optionally clamps the client's `x-cuobj-chunk-size`
-  to the server's staging size, then calls `handle_get` and maps its return code to
-  the HTTP status (`200`/`206`/`404`/`416`/`500`).
+- for GET, validates the `x-amz-rdma-token` header (→ `400` if missing), calls
+  `handle_get` (which parses the remote buffer address from the RDMA descriptor)
+  and maps its return code to the HTTP status (`200`/`206`/`404`/`416`/`500`).
+  On success, responds with `x-amz-rdma-reply: 200`.
 
 The httplib thread pool is sized to `min(max_concurrency, 256)`
 ([s3_server.cpp:340](../server/s3_server.cpp#L340)); real back-pressure comes from
@@ -175,17 +175,18 @@ buffer the real data starts so the RDMA write skips the alignment padding.
 
 ## Wire protocol reference
 
-All header constants live in [common/s3_util.hpp:11-15](../common/s3_util.hpp#L11).
+All header constants live in [common/s3_util.hpp](../common/s3_util.hpp).
+Only standard cuObject headers are used (see
+[NVIDIA cuObject docs](https://docs.nvidia.com/gpudirect-storage/cuobject/index.html)).
 
 | Header | Direction | Meaning |
 |--------|-----------|---------|
-| `x-amz-rdma-token` | client → server | base64 of `cufileRDMAInfo_t::desc_str` (the opaque RDMA descriptor) |
-| `x-cuobj-remote-addr` | client → server | client buffer address; RDMA target base |
-| `x-cuobj-size` | client → server | requested transfer size — **sent but currently unread by the server** |
-| `x-cuobj-chunk-size` | client → server | optional per-chunk size, clamped to the server's staging size |
-| `x-amz-rdma-bytes-transferred` | server → client | bytes the server actually RDMA-wrote |
+| `x-amz-rdma-token` | client → server | base64 of `cufileRDMAInfo_t::desc_str` (opaque RDMA descriptor; contains remote buffer address, rkey, GID, etc.) |
+| `x-amz-rdma-reply` | server → client | RDMA status: `"200"` on success |
 
 Standard `Range: bytes=a-b` is also used for range GETs; the server answers `206`.
+The server extracts the client's remote buffer base address from the RDMA
+descriptor (DC_V1 format: colon-separated hex fields, first field = `buf_address`).
 
 ## common/ helpers
 
@@ -210,9 +211,6 @@ Noted here so `design.md` can be reconciled later:
    `sha256_hex` is never called. `sha256.hpp` is only `#include`d at
    [client/main.cpp:31](../client/main.cpp#L31); the benchmark client performs no
    integrity check on fetched data.
-2. **`x-cuobj-size` is unused server-side.** The client sends `kHdrSize`
-   ([s3_client.cpp:44](../client/s3_client.cpp#L44)), but `handle_get` never reads
-   it — the transfer length comes from the file size and the optional `Range`.
-3. **Chunking is server-side, via one callback.** The data path is *not* "one
+2. **Chunking is server-side, via one callback.** The data path is *not* "one
    callback per chunk". `cuObjGet` calls `get_callback` once per object; chunking and
    pipelining happen entirely inside the server's `handle_get` loop.
