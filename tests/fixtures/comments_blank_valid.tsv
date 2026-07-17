@@ -1,0 +1,4 @@
+# Manifest fixture with skipped records.
+
+   # Leading-space comments are skipped too.
+commented-object.bin	8192	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
