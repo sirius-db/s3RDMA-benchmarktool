@@ -129,6 +129,11 @@ Manifest parse_manifest(std::istream& in, ParseStatus& status) {
         fail(line_no, "zero prefix length");
         return manifest;
       }
+      if (prefix_len > entry.size) {
+        fail(line_no, "prefix length " + len_str + " exceeds object size " +
+                          std::to_string(entry.size) + " for key '" + entry.key + "'");
+        return manifest;
+      }
       const std::string digest = token.substr(eq + 1);
       if (!is_lower_hex_64(digest)) {
         fail(line_no, "prefix digest at length " + len_str +
@@ -146,6 +151,13 @@ Manifest parse_manifest(std::istream& in, ParseStatus& status) {
       fail(line_no, "duplicate record for key '" + entry.key + "'");
       return manifest;
     }
+  }
+
+  // Fail closed on a stream I/O error (distinct from a clean EOF): a truncated
+  // or errored read must never surface as a valid, complete manifest.
+  if (in.bad()) {
+    fail(line_no, "stream I/O error while reading the manifest");
+    return manifest;
   }
 
   status.ok = true;
@@ -187,10 +199,27 @@ ClosureStatus validate_closure(const Manifest& manifest,
       return fail("unsupported span for key '" + span.key +
                   "': only full-object and prefix spans are verifiable");
     }
-    if (span.size == 0) continue;  // full object: full_sha256 is always present
-    if (entry.prefix_sha256.find(span.size) == entry.prefix_sha256.end()) {
+    if (span.size > entry.size) {
+      return fail("requested span " + std::to_string(span.size) + " for key '" +
+                  span.key + "' exceeds object size " + std::to_string(entry.size));
+    }
+    // Validate the digest the span relies on directly, so a programmatically
+    // constructed manifest (bypassing the parser's guarantees) cannot pass
+    // closure with an empty or malformed digest.
+    if (span.size == 0) {  // full object
+      if (!is_lower_hex_64(entry.full_sha256)) {
+        return fail("full digest for key '" + span.key + "' is not a valid SHA256");
+      }
+      continue;
+    }
+    const auto prefix_it = entry.prefix_sha256.find(span.size);
+    if (prefix_it == entry.prefix_sha256.end()) {
       return fail("no prefix digest for key '" + span.key + "' at length " +
                   std::to_string(span.size));
+    }
+    if (!is_lower_hex_64(prefix_it->second)) {
+      return fail("prefix digest for key '" + span.key + "' at length " +
+                  std::to_string(span.size) + " is not a valid SHA256");
     }
   }
 

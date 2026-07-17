@@ -45,7 +45,12 @@ bool Sampler::should_sample(uint32_t key_id, uint64_t occurrence) const {
   const uint32_t threads = num_threads_ == 0 ? 1 : num_threads_;
   const uint32_t stride = every_ / threads == 0 ? 1 : every_ / threads;
   const uint64_t keyed = mix64(seed_ ^ (0x517cc1b727220a95ULL * (static_cast<uint64_t>(key_id) + 1)));
-  const uint64_t phase = (keyed + static_cast<uint64_t>(thread_id_) * stride) % every_;
+  // Reduce each term mod `every_` before combining so a 64-bit overflow in the
+  // sum cannot shift the phase (2^64 % every_ is generally nonzero): both terms
+  // are then < every_, the sum is < 2*every_, and the final residue is exact.
+  const uint64_t keyed_phase = keyed % every_;
+  const uint64_t thread_phase = (static_cast<uint64_t>(thread_id_) * stride) % every_;
+  const uint64_t phase = (keyed_phase + thread_phase) % every_;
   return occurrence % every_ == phase;
 }
 
