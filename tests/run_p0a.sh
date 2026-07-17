@@ -156,9 +156,9 @@ if [[ ! "${last_line}" =~ ^SELFTEST\ PASS\ ([0-9]+)/([0-9]+)$ ]]; then
   exit 1
 fi
 if [[ "${HAVE_LIBCRYPTO}" -eq 1 ]]; then
-  expected_checks=61
+  expected_checks=80
 else
-  expected_checks=57
+  expected_checks=76
 fi
 if [[ "${BASH_REMATCH[1]}" -ne "${BASH_REMATCH[2]}" ||
       "${BASH_REMATCH[2]}" -ne "${expected_checks}" ]]; then

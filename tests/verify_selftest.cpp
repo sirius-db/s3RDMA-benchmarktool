@@ -22,8 +22,11 @@
 #include <iostream>
 #include <map>
 #include <set>
+#include <sstream>
 #include <stdexcept>
+#include <streambuf>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "verify/manifest.hpp"
@@ -85,6 +88,31 @@ class TestState {
 
 #define CHECK(state, condition, ac, message) \
   (state).check((condition), (ac), (message), __FILE__, __LINE__)
+
+class FailingAfterRecordStreambuf final : public std::streambuf {
+ public:
+  explicit FailingAfterRecordStreambuf(std::string record)
+      : record_(std::move(record)) {}
+
+  bool fault_injected() const noexcept { return fault_injected_; }
+
+ protected:
+  int_type underflow() override {
+    if (!record_served_) {
+      record_served_ = true;
+      char* begin = record_.data();
+      setg(begin, begin, begin + record_.size());
+      return traits_type::to_int_type(*gptr());
+    }
+    fault_injected_ = true;
+    throw std::ios_base::failure("injected stream read failure");
+  }
+
+ private:
+  std::string record_;
+  bool record_served_ = false;
+  bool fault_injected_ = false;
+};
 
 Manifest parse_fixture(const std::string& name, ParseStatus& status) {
   const std::string path = "tests/fixtures/" + name;
@@ -211,6 +239,60 @@ void test_manifest_parser(TestState& state) {
   CHECK(state, status.line == 6, "AC7", "error counts skipped physical lines");
 }
 
+void test_manifest_stream_errors(TestState& state) {
+  const std::string valid_record =
+      std::string("stream-object.bin\t10\t") + kDigestA + "\n";
+
+  std::istringstream prefailed_input("");
+  prefailed_input.setstate(std::ios::badbit);
+  ParseStatus status;
+  s3rdma::verify::parse_manifest(prefailed_input, status);
+  CHECK(state, !status.ok && !status.error.empty(), "AC19",
+        "a stream with badbit already set fails closed");
+
+  FailingAfterRecordStreambuf failing_buffer(valid_record);
+  std::istream failing_input(&failing_buffer);
+  status = {};
+  const Manifest partial_manifest =
+      s3rdma::verify::parse_manifest(failing_input, status);
+  CHECK(state,
+        failing_buffer.fault_injected() && failing_input.bad() && !failing_input.eof(),
+        "AC19",
+        "the injected post-record failure sets badbit rather than eofbit");
+  CHECK(state,
+        !status.ok && !status.error.empty() && status.line == 1 &&
+            partial_manifest.by_key.count("stream-object.bin") == 1,
+        "AC19",
+        "a hard read error after one valid record fails closed");
+
+  std::istringstream clean_input(valid_record);
+  status = {};
+  const Manifest clean_manifest = s3rdma::verify::parse_manifest(clean_input, status);
+  CHECK(state,
+        status.ok && !clean_input.bad() && clean_manifest.by_key.count("stream-object.bin") == 1,
+        "AC19", "clean EOF after the same valid record remains successful");
+}
+
+void test_manifest_prefix_bounds(TestState& state) {
+  ParseStatus status;
+  parse_fixture("bad_prefix_len_gt_size.tsv", status);
+  CHECK(state, !status.ok && status.line == 1 && !status.error.empty(), "AC20",
+        "a prefix longer than its object is rejected on line one");
+
+  const std::string boundary_record =
+      std::string("boundary-prefix.bin\t10\t") + kDigestA + "\tprefix:10=" +
+      kDigestB + "\n";
+  std::istringstream boundary_input(boundary_record);
+  status = {};
+  const Manifest boundary_manifest =
+      s3rdma::verify::parse_manifest(boundary_input, status);
+  const auto entry = boundary_manifest.by_key.find("boundary-prefix.bin");
+  CHECK(state,
+        status.ok && entry != boundary_manifest.by_key.end() &&
+            entry->second.prefix_sha256.count(10) == 1,
+        "AC20", "a prefix equal to its object size is accepted");
+}
+
 Manifest closure_manifest() {
   Manifest manifest;
 
@@ -269,6 +351,43 @@ void test_closure(TestState& state) {
       manifest, {{"object-full.bin", 0, 0}}, missing_head);
   CHECK(state, !status.ok && !status.error.empty(), "AC12",
         "manifest key absent from HEAD results fails closure");
+}
+
+void test_closure_self_validation(TestState& state) {
+  const std::map<std::string, uint64_t> heads = {{"direct-object.bin", 10}};
+
+  Manifest valid;
+  ManifestEntry valid_entry;
+  valid_entry.key = "direct-object.bin";
+  valid_entry.size = 10;
+  valid_entry.full_sha256 = kDigestA;
+  valid_entry.prefix_sha256.emplace(5, kDigestB);
+  valid.by_key.emplace(valid_entry.key, valid_entry);
+
+  ClosureStatus status = s3rdma::verify::validate_closure(
+      valid, {{"direct-object.bin", 0, 11}}, heads);
+  CHECK(state, !status.ok && !status.error.empty(), "AC21",
+        "closure rejects a requested span larger than the object");
+
+  Manifest empty_full_digest = valid;
+  empty_full_digest.by_key.at("direct-object.bin").full_sha256.clear();
+  status = s3rdma::verify::validate_closure(
+      empty_full_digest, {{"direct-object.bin", 0, 0}}, heads);
+  CHECK(state, !status.ok && !status.error.empty(), "AC21",
+        "closure rejects an empty full-object digest");
+
+  Manifest malformed_prefix_digest = valid;
+  malformed_prefix_digest.by_key.at("direct-object.bin").prefix_sha256.at(5) =
+      std::string(63, 'b');
+  status = s3rdma::verify::validate_closure(
+      malformed_prefix_digest, {{"direct-object.bin", 0, 5}}, heads);
+  CHECK(state, !status.ok && !status.error.empty(), "AC21",
+        "closure rejects a malformed prefix digest");
+
+  status = s3rdma::verify::validate_closure(
+      valid, {{"direct-object.bin", 0, 0}, {"direct-object.bin", 0, 5}}, heads);
+  CHECK(state, status.ok && status.error.empty(), "AC21",
+        "closure accepts independently constructed valid full and prefix spans");
 }
 
 void test_sampler(TestState& state) {
@@ -357,6 +476,59 @@ void test_sampler(TestState& state) {
                     [](int occurrence) { return occurrence >= 0; }) &&
             std::set<int>(first_samples.begin(), first_samples.end()).size() > 1,
         "AC16", "thread sampling phases are not all equal");
+
+  struct SamplingConfig {
+    uint32_t every;
+    uint32_t threads;
+  };
+  const std::array<SamplingConfig, 4> wrap_configs = {
+      SamplingConfig{3, 2}, SamplingConfig{5, 3}, SamplingConfig{7, 4},
+      SamplingConfig{2, 2}};
+  constexpr uint64_t wrap_seed = 0x601e4b415c033b3eULL;
+  for (const SamplingConfig config : wrap_configs) {
+    std::vector<int> phases(config.threads, -1);
+    for (uint32_t thread = 0; thread < config.threads; ++thread) {
+      Sampler sampler(wrap_seed, config.every, thread, config.threads);
+      for (uint64_t occurrence = 0; occurrence < config.every; ++occurrence) {
+        if (sampler.should_sample(0, occurrence)) {
+          phases[thread] = static_cast<int>(occurrence);
+          break;
+        }
+      }
+    }
+    const bool all_threads_sample =
+        std::all_of(phases.begin(), phases.end(),
+                    [](int occurrence) { return occurrence >= 0; });
+    const std::string found_message =
+        "every thread samples within one window for every=" +
+        std::to_string(config.every) + ", threads=" + std::to_string(config.threads);
+    CHECK(state, all_threads_sample, "AC22", found_message.c_str());
+
+    const std::string dephased_message =
+        "thread phases are spread for every=" + std::to_string(config.every) +
+        ", threads=" + std::to_string(config.threads);
+    CHECK(state,
+          all_threads_sample && config.threads <= config.every &&
+              std::set<int>(phases.begin(), phases.end()).size() > 1,
+          "AC22", dephased_message.c_str());
+  }
+
+  constexpr uint32_t non_four_every = 5;
+  Sampler non_four_windowed(wrap_seed, non_four_every, 2, 3);
+  std::vector<bool> non_four_decisions;
+  non_four_decisions.reserve(55);
+  for (uint64_t occurrence = 0; occurrence < 55; ++occurrence) {
+    non_four_decisions.push_back(non_four_windowed.should_sample(0, occurrence));
+  }
+  bool non_four_windows_have_one = true;
+  for (size_t start = 0; start + non_four_every <= non_four_decisions.size(); ++start) {
+    const auto count =
+        std::count(non_four_decisions.begin() + start,
+                   non_four_decisions.begin() + start + non_four_every, true);
+    non_four_windows_have_one = non_four_windows_have_one && count == 1;
+  }
+  CHECK(state, non_four_windows_have_one, "AC22",
+        "every=5 retains exactly one sample in every sliding window");
 }
 
 #if S3RDMA_HAVE_LIBCRYPTO
@@ -436,7 +608,10 @@ int main(int argc, char** argv) {
 
   try {
     test_manifest_parser(state);
+    test_manifest_stream_errors(state);
+    test_manifest_prefix_bounds(state);
     test_closure(state);
+    test_closure_self_validation(state);
     test_sampler(state);
 #if S3RDMA_HAVE_LIBCRYPTO
     test_sha256(state, options.pattern_path);
