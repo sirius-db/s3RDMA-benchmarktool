@@ -110,3 +110,4 @@ target_link_libraries(s3rdma_common INTERFACE CUDA::cudart)
 
 add_subdirectory(client)
 add_subdirectory(server)
+add_subdirectory(probe)
