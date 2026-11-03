@@ -65,6 +65,7 @@
 #include "base64.hpp"
 #include "buffers.hpp"
 #include "cuobj_check.hpp"
+#include "s3_protocol.hpp"
 #include "s3_util.hpp"
 #include "sha256.hpp"
 
@@ -358,12 +359,13 @@ struct ProbeContext {
   int port = 8080;
   std::string path;
   std::string range;
+  const s3rdma::ProtocolOptions* proto = nullptr;
   const void* arena_base = nullptr;
   std::atomic<int> callbacks{0};
 };
 
-ssize_t probe_get_callback(const void* handle, char* ptr, size_t size, loff_t offset,
-                           const cufileRDMAInfo_t* rdma) {
+ssize_t probe_get_callback_impl(const void* handle, char* ptr, size_t size, loff_t offset,
+                                const cufileRDMAInfo_t* rdma) {
   auto* ctx = static_cast<ProbeContext*>(cuObjClient::getCtx(handle));
   if (ctx == nullptr || rdma == nullptr) return -1;
   const int idx = ctx->callbacks.fetch_add(1);
@@ -378,12 +380,28 @@ ssize_t probe_get_callback(const void* handle, char* ptr, size_t size, loff_t of
       .num("cb_offset", static_cast<long long>(offset))
       .emit();
 
-  httplib::Headers headers = {
-      {s3rdma::kHdrRdmaToken, s3rdma::base64_encode(rdma->desc_str, rdma->desc_len)},
-  };
-  if (!ctx->range.empty()) headers.emplace("Range", ctx->range);
+  const s3rdma::ProtocolOptions& proto = *ctx->proto;
+  std::string target;
+  httplib::Headers headers;
+  try {
+    const std::string token =
+        s3rdma::encode_rdma_token(rdma->desc_str, rdma->desc_len, proto.token_encoding);
+    target = s3rdma::control_plane_target(proto, ctx->path);
+    for (auto& h : s3rdma::control_plane_headers(proto, "GET",
+                                                 s3rdma::http_host_header(ctx->host, ctx->port),
+                                                 ctx->path, ctx->range, token))
+      headers.emplace(h.first, h.second);
+    if (token.empty() && proto.token_encoding == s3rdma::TokenEncoding::Base64 &&
+        proto.auth == s3rdma::AuthMode::None)
+      headers.emplace(s3rdma::kHdrRdmaToken, "");
+  } catch (const std::exception& e) {
+    ctx->log->event("callback_end").str("who", ctx->who).num("call_index", idx)
+        .boolean("http_ok", false).str("request_error", e.what())
+        .num("returns", -1).emit();
+    return -1;
+  }
   httplib::Client cli(ctx->host, ctx->port);
-  auto res = cli.Get(ctx->path, headers);
+  auto res = cli.Get(target, headers);
 
   Line line = ctx->log->event("callback_end");
   line.str("who", ctx->who).num("call_index", idx);
@@ -392,17 +410,43 @@ ssize_t probe_get_callback(const void* handle, char* ptr, size_t size, loff_t of
     line.boolean("http_ok", false).str("transport_error", httplib::to_string(res.error()));
   } else {
     line.boolean("http_ok", true).num("http_status", res->status);
-    if (res->has_header(s3rdma::kHdrRdmaReply)) {
-      const std::string raw = res->get_header_value(s3rdma::kHdrRdmaReply);
-      line.boolean("reply_present", true)
-          .str("reply_b64", s3rdma::base64_encode(raw.data(), raw.size()));
-    } else {
-      line.boolean("reply_present", false);
+    const bool reply_present = res->has_header(s3rdma::kHdrRdmaReply);
+    const std::string raw = reply_present ? res->get_header_value(s3rdma::kHdrRdmaReply) : "";
+    const s3rdma::RdmaReply reply = s3rdma::parse_rdma_reply(reply_present, raw);
+    line.boolean("reply_present", reply_present)
+        .str("reply_b64", s3rdma::base64_encode(raw.data(), raw.size()))
+        .str("reply_kind", reply.kind == s3rdma::RdmaReply::Kind::Code ? "code"
+                           : reply.kind == s3rdma::RdmaReply::Kind::Declined ? "declined" : "malformed")
+        .num("reply_code", reply.code);
+    const bool count_present = res->has_header(s3rdma::kHdrRdmaBytesTransferred);
+    const long declared = s3rdma::parse_rdma_bytes_transferred(
+        count_present, count_present ? res->get_header_value(s3rdma::kHdrRdmaBytesTransferred) : "",
+        size);
+    line.boolean("count_present", count_present).num("bytes_transferred_declared", declared);
+    // Legacy Base64 reports size on HTTP 200/206. Verbatim GETs require matching
+    // HTTP/RDMA status and use the declared count; absent/empty counts mean zero.
+    if (res->status == 200 || res->status == 206) {
+      if (proto.token_encoding == s3rdma::TokenEncoding::Base64) {
+        rc = static_cast<ssize_t>(size);
+      } else if (reply.kind == s3rdma::RdmaReply::Kind::Code &&
+                 reply.code == res->status) {
+        rc = static_cast<ssize_t>(declared);
+      }
     }
-    if (res->status == 200 || res->status == 206) rc = static_cast<ssize_t>(size);
   }
   line.num("returns", static_cast<long long>(rc)).emit();
   return rc;
+}
+
+// Nothing may leave the callback through the SDK's frames.
+ssize_t probe_get_callback(const void* handle, char* ptr, size_t size, loff_t offset,
+                           const cufileRDMAInfo_t* rdma) noexcept {
+  try {
+    return probe_get_callback_impl(handle, ptr, size, offset, rdma);
+  } catch (...) {
+    std::fputs("probe_get_callback: exception\n", stderr);
+    return -1;
+  }
 }
 
 // ---- Raw cuObjClient wrapper ------------------------------------------------
@@ -460,6 +504,7 @@ struct Options {
   size_t guard = 64ULL * 1024;
   size_t arena_bytes = 0;
   int concurrent = 0;
+  s3rdma::ProtocolOptions proto;
 };
 
 void usage(const char* a0) {
@@ -472,8 +517,9 @@ void usage(const char* a0) {
                "  --arena-bytes <bytes>  override arena size\n"
                "  --concurrent <n>       si/r only: n>=2 (0=serial; 1 is rejected)\n"
                "  --expect-sha <hex64>   known digest of object[0,xfer); required for PASS\n"
+               "%s"
                "Verdict PASS/FAIL/INCONCLUSIVE/ENV_ERROR; exit 0/1/4/3.\n",
-               a0);
+               a0, s3rdma::kProtocolUsage);
 }
 
 bool parse_size_arg(const char* s, size_t& out) {
@@ -526,6 +572,10 @@ bool parse_options(int argc, char** argv, Options& o) {
     } else if (a == "--expect-sha" && (v = next())) {
       o.expect_sha = v;
       if (!is_lower_hex_64(o.expect_sha)) return false;
+    } else if (auto f = s3rdma::parse_protocol_flag(a, (i + 1 < argc) ? argv[i + 1] : nullptr, o.proto);
+               f.matched) {
+      if (!f.ok) return false;
+      if (f.used_value) ++i;
     } else {
       return false;
     }
@@ -550,8 +600,20 @@ struct HeadResult {
 
 HeadResult head_object(const Options& o, const std::string& path) {
   HeadResult r;
+  std::string target;
+  httplib::Headers headers;
+  try {
+    target = s3rdma::control_plane_target(o.proto, path);
+    for (auto& h : s3rdma::control_plane_headers(o.proto, "HEAD",
+                                                 s3rdma::http_host_header(o.host, o.port), path, "", ""))
+      headers.emplace(h.first, h.second);
+  } catch (const std::exception& e) {
+    r.ok = false;
+    r.detail = std::string("HEAD request build failure: ") + e.what();
+    return r;
+  }
   httplib::Client cli(o.host, o.port);
-  auto res = cli.Head(path);
+  auto res = cli.Head(target, headers);
   if (!res) {
     r.ok = false;
     r.detail = "HEAD transport failure: " + httplib::to_string(res.error());
@@ -607,6 +669,7 @@ GetResult issue_get(const Jsonl& log, const Options& o, ProbeClient& client,
   ctx.port = o.port;
   ctx.path = "/" + o.bucket + "/" + o.object;
   ctx.range = "bytes=0-" + std::to_string(o.xfer - 1);
+  ctx.proto = &o.proto;
   ctx.arena_base = arena.data();
 
   GetResult g;
@@ -742,6 +805,9 @@ int main(int argc, char** argv) {
   }
 
   const Jsonl log(o.exp);
+  std::string proto_error;
+  if (!s3rdma::finish_protocol_options(o.proto, proto_error))
+    return result(log, Verdict::EnvError, proto_error);
   CUDA_CHECK(cudaSetDevice(0));
 
   const BufferMode mode = s3rdma::parse_mode(o.mode);
@@ -959,12 +1025,24 @@ int main(int argc, char** argv) {
     if (tok == 0 && desc != nullptr) {
       prepare_slot(arena, slot, poison);
       if (mode == BufferMode::Gpu) CUDA_CHECK(cudaDeviceSynchronize());
-      httplib::Headers headers = {
-          {s3rdma::kHdrRdmaToken, s3rdma::base64_encode(desc, std::strlen(desc))},
-          {"Range", "bytes=0-" + std::to_string(o.xfer - 1)},
-      };
+      std::string target;
+      httplib::Headers headers;
+      try {
+        target = s3rdma::control_plane_target(o.proto, path);
+        for (const auto& h : s3rdma::control_plane_headers(
+                 o.proto, "GET", s3rdma::http_host_header(o.host, o.port), path,
+                 "bytes=0-" + std::to_string(o.xfer - 1),
+                 s3rdma::encode_rdma_token(desc, std::strlen(desc),
+                                          o.proto.token_encoding)))
+          headers.emplace(h.first, h.second);
+      } catch (...) {
+        a.put_token(desc);
+        a.deregister_memory(arena.data());
+        return result(log, Verdict::EnvError,
+                      "manual request build failed before HTTP emission");
+      }
       httplib::Client cli(o.host, o.port);
-      auto res = cli.Get(path, headers);
+      auto res = cli.Get(target, headers);
       const int status = res ? res->status : 0;
       log.event("manual_get").num("http_status", status)
           .boolean("reply_present", res && res->has_header(s3rdma::kHdrRdmaReply)).emit();

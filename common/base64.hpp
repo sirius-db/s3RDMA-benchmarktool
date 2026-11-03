@@ -14,9 +14,7 @@
  * limitations under the License.
  */
 
-// Minimal base64 encode/decode used to carry the opaque cuObject RDMA
-// descriptor (cufileRDMAInfo_t::desc_str, which is binary) inside an HTTP
-// header on the fake-S3 control path. Header-only, no external deps.
+// Base64 carries descriptor bytes on the legacy fake-S3 control path.
 #pragma once
 
 #include <cstdint>

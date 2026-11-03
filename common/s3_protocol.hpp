@@ -35,7 +35,6 @@
 
 namespace s3rdma {
 
-inline constexpr const char* kHdrRdmaBytesTransferred = "x-amz-rdma-bytes-transferred";
 inline constexpr int kRdmaReplyDeclined = 501;
 
 enum class TokenEncoding { Verbatim, Base64 };
@@ -58,6 +57,73 @@ inline bool parse_auth_mode(const std::string& s, AuthMode& out) {
   if (s == "none") { out = AuthMode::None; return true; }
   if (s == "sigv4") { out = AuthMode::SigV4; return true; }
   return false;
+}
+
+// Protocol flags apply in command-line order; --gateway consumes no value.
+struct ProtocolFlag {
+  bool matched = false;
+  bool used_value = false;
+  bool ok = true;
+};
+
+inline ProtocolFlag parse_protocol_flag(const std::string& arg, const char* value,
+                                        ProtocolOptions& o) {
+  ProtocolFlag f;
+  if (arg == "--gateway") {
+    f.matched = true;
+    o.token_encoding = TokenEncoding::Verbatim;
+    o.auth = AuthMode::SigV4;
+    return f;
+  }
+  if (arg != "--token-encoding" && arg != "--auth" && arg != "--region") return f;
+  f.matched = true;
+  f.used_value = true;
+  if (value == nullptr || *value == '\0' || *value == '-') {
+    f.ok = false;
+    return f;
+  }
+  if (arg == "--token-encoding") f.ok = parse_token_encoding(value, o.token_encoding);
+  else if (arg == "--auth") f.ok = parse_auth_mode(value, o.auth);
+  else o.region = value;
+  return f;
+}
+
+inline const char* kProtocolUsage =
+    "  --token-encoding <verbatim|base64>  RDMA token header form (default: base64, the\n"
+    "                        shipped fake-S3 convention; verbatim for a standard gateway)\n"
+    "  --auth <none|sigv4>   Control-plane authentication (default: none); sigv4 reads\n"
+    "                        AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY [/ AWS_SESSION_TOKEN]\n"
+    "  --region <name>       SigV4 signing region (default: us-east-1)\n"
+    "  --gateway             Shorthand for --token-encoding verbatim --auth sigv4\n";
+
+// Loads credentials when SigV4 is selected; false (with a message, no secret
+// material) when they are missing.
+inline bool finish_protocol_options(ProtocolOptions& o, std::string& error) {
+  if (o.auth == AuthMode::SigV4 && !sigv4_credentials_from_env(o.credentials)) {
+    error = "--auth sigv4 needs AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in the environment";
+    return false;
+  }
+  return true;
+}
+
+// The Host header cpp-httplib sends for a plain-HTTP client: the port is
+// omitted only when it is 80. The signed value must match it byte for byte.
+inline std::string http_host_header(const std::string& host, int port) {
+  std::string authority = host;
+  if (host.find(':') != std::string::npos && host.front() != '[')
+    authority = "[" + host + "]";
+  if (port != 80) authority += ":" + std::to_string(port);
+  return authority;
+}
+
+// The request target to hand to the HTTP client. The signer canonicalises the
+// raw path, so a standard-contract request must send exactly that encoding;
+// the legacy fake-S3 pair keeps its historical raw target.
+inline std::string control_plane_target(const ProtocolOptions& o,
+                                        const std::string& raw_path) {
+  if (o.token_encoding == TokenEncoding::Base64 && o.auth == AuthMode::None)
+    return raw_path;
+  return sigv4_detail::uri_encode(raw_path, true);
 }
 
 // Verbatim headers omit trailing NUL bytes; legacy Base64 preserves all len bytes.

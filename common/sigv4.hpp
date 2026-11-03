@@ -59,9 +59,9 @@ inline bool sigv4_credentials_from_env(SigV4Credentials& out) {
 
 using HeaderList = std::vector<std::pair<std::string, std::string>>;
 
-// One request to sign. `path` is raw; `query` is already canonical. Caller
-// headers retain their wire order. Host, date, payload-hash, session-token and
-// Authorization headers are managed here and must not also appear in `headers`.
+// `path` is raw; `query` is already canonical. Caller headers retain their
+// wire order. Host, date, payload-hash, session-token and Authorization
+// headers are managed here and must not also appear in `headers`.
 struct SigV4Request {
   std::string method;
   std::string host;  // Host header value, "name" or "name:port"

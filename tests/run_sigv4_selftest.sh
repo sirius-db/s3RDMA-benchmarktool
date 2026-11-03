@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Build and run the rig-free SigV4 / control-plane protocol self-test.
-# Needs only a C++17 compiler and OpenSSL's libcrypto (headers + library);
-# pass extra include/lib flags via CXXFLAGS / LDFLAGS when they are not on
-# the default search path.
+# Requires a C++17 compiler and OpenSSL 3.0+ headers and libcrypto.
+# Pass extra include/library flags via CXXFLAGS / LDFLAGS when needed.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

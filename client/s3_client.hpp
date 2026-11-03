@@ -28,6 +28,8 @@
 
 #include <cuobjclient.h>
 
+#include "s3_protocol.hpp"
+
 namespace s3rdma {
 
 // Per-request context recovered inside the get callback via cuObjClient::getCtx.
@@ -36,11 +38,12 @@ struct GetContext {
   int port = 8080;
   std::string path;    // "/<bucket>/<object>"
   std::string range;   // "bytes=a-b" or empty
+  const ProtocolOptions* proto = nullptr;  // owned by the S3Client
 };
 
 class S3Client {
  public:
-  S3Client(std::string host, int port);
+  S3Client(std::string host, int port, ProtocolOptions proto = {});
   ~S3Client();
 
   // Register buffer, perform GET (full if range empty), deregister.
@@ -59,6 +62,7 @@ class S3Client {
  private:
   std::string host_;
   int port_;
+  ProtocolOptions proto_;
   CUObjOps_t ops_{};
   cuObjClient* client_ = nullptr;
 };

@@ -108,6 +108,10 @@ void test_encoding_and_headers() {
         "verbatim token drops the terminating NUL");
   check(encode_rdma_token(desc, sizeof desc, TokenEncoding::Base64) == "N2Y6MQA=", "E3",
         "legacy Base64 preserves all desc_len bytes");
+  check(encode_rdma_token(desc, sizeof desc - 1, TokenEncoding::Verbatim) == "7f:1", "E3",
+        "verbatim token excludes a terminator outside desc_len");
+  check(encode_rdma_token(desc, sizeof desc - 1, TokenEncoding::Base64) == "N2Y6MQ==", "E3",
+        "legacy Base64 excludes a terminator outside desc_len");
 
   ProtocolOptions o;
   auto plain = control_plane_headers(o, "GET", "h:8080", "/b/k", "bytes=0-1", "tok", 0);
@@ -175,15 +179,53 @@ void test_combined_vector() {
 // surface as an exception, not as an empty or indeterminate digest.
 void test_crypto_failure_is_loud() {
   using namespace s3rdma;
-  EVP_set_default_properties(nullptr, "provider=s3rdma-no-such-provider");
+  check(EVP_set_default_properties(nullptr, "provider=s3rdma-no-such-provider") == 1,
+        "F1", "unavailable-provider query is installed");
   bool sha_threw = false, hmac_threw = false;
   try { sha256_hex("x", 1); } catch (const std::runtime_error&) { sha_threw = true; }
   try { sigv4_detail::hmac_sha256("k", "d"); } catch (const std::runtime_error&) { hmac_threw = true; }
-  EVP_set_default_properties(nullptr, "");
+  check(EVP_set_default_properties(nullptr, "") == 1,
+        "F1", "default property query is cleared");
   check(sha_threw, "F1", "SHA256 failure throws");
   check(hmac_threw, "F1", "HMAC-SHA256 failure throws");
   check(sha256_hex("", 0) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "F1",
-        "digests work again after the property query is restored");
+        "digests work again after the default property query is cleared");
+}
+
+void test_targets_flags_and_host() {
+  using namespace s3rdma;
+  ProtocolOptions legacy;
+  check(control_plane_target(legacy, "/b/a%2Fb") == "/b/a%2Fb", "T1", "legacy target is the raw path");
+  ProtocolOptions gw;
+  gw.token_encoding = TokenEncoding::Verbatim;
+  gw.auth = AuthMode::SigV4;
+  check(control_plane_target(gw, "/b/a%2Fb") == "/b/a%252Fb", "T1", "standard target encodes a literal percent");
+  check(control_plane_target(gw, "/b/a?x=1") == "/b/a%3Fx%3D1", "T1", "standard target never carries a literal query");
+  check(control_plane_target(gw, "/b/a b+\xc3\xa9//c") == "/b/a%20b%2B%C3%A9//c", "T1",
+        "standard target keeps repeated slashes");
+
+  check(http_host_header("h", 80) == "h", "T2", "port 80 is omitted");
+  check(http_host_header("h", 443) == "h:443", "T2", "plain-HTTP 443 is kept");
+  check(http_host_header("::1", 8080) == "[::1]:8080", "T2", "bare IPv6 hosts are bracketed");
+  check(http_host_header("[::1]", 80) == "[::1]", "T2", "pre-bracketed IPv6 hosts stay as given");
+
+  ProtocolOptions o;
+  auto f = parse_protocol_flag("--region", "--gateway", o);
+  check(f.matched && !f.ok, "T3", "a switch-looking region value is rejected");
+  f = parse_protocol_flag("--region", "", o);
+  check(f.matched && !f.ok, "T3", "an empty region value is rejected");
+  f = parse_protocol_flag("--region", nullptr, o);
+  check(f.matched && !f.ok, "T3", "a missing region value is rejected");
+  f = parse_protocol_flag("--token-encoding", "hex", o);
+  check(f.matched && f.used_value && !f.ok, "T3", "an unknown token encoding is rejected");
+  f = parse_protocol_flag("--gateway", "--bucket", o);
+  check(f.matched && !f.used_value && f.ok && o.token_encoding == TokenEncoding::Verbatim &&
+            o.auth == AuthMode::SigV4 && o.region == "us-east-1",
+        "T3", "--gateway consumes no value and keeps the region");
+  f = parse_protocol_flag("--auth", "none", o);
+  check(f.ok && o.auth == AuthMode::None && o.token_encoding == TokenEncoding::Verbatim, "T3",
+        "a later explicit flag overrides the preset in command-line order");
+  check(!parse_protocol_flag("--bucket", "b", o).matched, "T3", "unrelated flags are not consumed");
 }
 
 void test_reply_parsing() {
@@ -236,6 +278,7 @@ int main() {
   test_encoding_and_headers();
   test_repeated_and_managed_headers();
   test_combined_vector();
+  test_targets_flags_and_host();
   test_reply_parsing();
   test_crypto_failure_is_loud();
   if (g_failed == 0) std::cout << "SELFTEST PASS " << g_total << '/' << g_total << '\n';

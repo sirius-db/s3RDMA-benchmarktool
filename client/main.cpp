@@ -56,6 +56,7 @@ struct Args {
   int threads = 1;
   int duration = 10;  // seconds
   size_t range_size = 0;  // 0 = full object; >0 = range read of this many bytes
+  s3rdma::ProtocolOptions proto;
 };
 
 void print_usage(const char* argv0) {
@@ -70,8 +71,9 @@ void print_usage(const char* argv0) {
       "  --duration <secs>     Sustained benchmark duration (default: 10)\n"
       "  --range-size <size>   Range-read size per GET, e.g. 1m, 16m (default: full object)\n"
       "  --out <path>          Dump last GET to file (single-thread only)\n"
+      "%s"
       "  -h, --help            Show this help\n",
-      argv0);
+      argv0, s3rdma::kProtocolUsage);
 }
 
 // Split a comma-separated string.
@@ -119,9 +121,21 @@ bool parse_int(const std::string& s, int& out) {
 }
 
 // Query the object size via HEAD.
-ssize_t head_size(const std::string& host, int port, const std::string& path) {
+ssize_t head_size(const std::string& host, int port, const std::string& path,
+                  const s3rdma::ProtocolOptions& proto) {
+  std::string target;
+  httplib::Headers headers;
+  try {
+    target = s3rdma::control_plane_target(proto, path);
+    for (auto& h : s3rdma::control_plane_headers(proto, "HEAD", s3rdma::http_host_header(host, port),
+                                                 path, "", ""))
+      headers.emplace(h.first, h.second);
+  } catch (const std::exception& e) {
+    LOG_ERROR("HEAD %s: cannot build request: %s", path.c_str(), e.what());
+    return -1;
+  }
   httplib::Client cli(host, port);
-  auto res = cli.Head(path);
+  auto res = cli.Head(target, headers);
   if (!res || res->status != 200) return -1;
   if (!res->has_header("Content-Length")) return -1;
   try {
@@ -148,7 +162,8 @@ struct ThreadResult {
 }  // namespace
 
 // Parse command-line arguments. Returns false on --help.
-bool parse_args(int argc, char** argv, Args& out) {
+bool parse_args(int argc, char** argv, Args& out, bool& help_requested) {
+  help_requested = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&](const char* name) -> const char* {
@@ -190,8 +205,23 @@ bool parse_args(int argc, char** argv, Args& out) {
         return false;
       }
     }
-    else if (a == "-h" || a == "--help") { print_usage(argv[0]); return false; }
-    else { LOG_ERROR("unknown argument: %s", a.c_str()); print_usage(argv[0]); return false; }
+    else if (a == "-h" || a == "--help") {
+      print_usage(argv[0]);
+      help_requested = true;
+      return false;
+    }
+    else {
+      const char* v = (i + 1 < argc) ? argv[i + 1] : nullptr;
+      auto f = s3rdma::parse_protocol_flag(a, v, out.proto);
+      if (!f.matched) { LOG_ERROR("unknown argument: %s", a.c_str()); print_usage(argv[0]); return false; }
+      if (!f.ok) { LOG_ERROR("invalid value for %s", a.c_str()); print_usage(argv[0]); return false; }
+      if (f.used_value) ++i;
+    }
+  }
+  std::string proto_error;
+  if (!s3rdma::finish_protocol_options(out.proto, proto_error)) {
+    LOG_ERROR("%s", proto_error.c_str());
+    return false;
   }
   if (out.bucket.empty() || out.objects.empty()) {
     LOG_ERROR("--bucket and at least one --object/--objects required");
@@ -205,12 +235,12 @@ bool parse_args(int argc, char** argv, Args& out) {
 // HEAD each object to discover sizes. Returns {obj_descs, max_size}.
 std::pair<std::vector<ObjDesc>, size_t> discover_objects(
     const std::string& host, int port, const std::string& bucket,
-    const std::vector<std::string>& keys) {
+    const std::vector<std::string>& keys, const s3rdma::ProtocolOptions& proto) {
   std::vector<ObjDesc> objs;
   size_t max_size = 0;
   for (auto& key : keys) {
     std::string p = "/" + bucket + "/" + key;
-    ssize_t sz = head_size(host, port, p);
+    ssize_t sz = head_size(host, port, p, proto);
     if (sz <= 0) { LOG_ERROR("HEAD %s failed", p.c_str()); std::exit(1); }
     objs.push_back({key, static_cast<size_t>(sz)});
     max_size = std::max(max_size, static_cast<size_t>(sz));
@@ -225,7 +255,8 @@ std::tuple<std::vector<ThreadResult>,
            double>
 setup_buffers_clients(s3rdma::BufferMode mode, size_t max_size, int N,
                       const std::string& host, int port,
-                      const std::string& mode_str) {
+                      const std::string& mode_str,
+                      const s3rdma::ProtocolOptions& proto) {
   std::vector<ThreadResult> results(N);
   std::vector<std::unique_ptr<s3rdma::Buffer>> bufs(N);
   std::vector<std::unique_ptr<s3rdma::S3Client>> clients(N);
@@ -233,7 +264,7 @@ setup_buffers_clients(s3rdma::BufferMode mode, size_t max_size, int N,
   auto alloc_t0 = std::chrono::steady_clock::now();
   for (int t = 0; t < N; ++t) {
     bufs[t] = std::make_unique<s3rdma::Buffer>(mode, max_size);
-    clients[t] = std::make_unique<s3rdma::S3Client>(host, port);
+    clients[t] = std::make_unique<s3rdma::S3Client>(host, port, proto);
     clients[t]->register_buffer(bufs[t]->data(), max_size);
   }
   auto alloc_t1 = std::chrono::steady_clock::now();
@@ -334,9 +365,11 @@ void cleanup(std::vector<std::unique_ptr<s3rdma::S3Client>>& clients,
 
 int main(int argc, char** argv) {
   Args args;
-  if (!parse_args(argc, argv, args)) return 0;
+  bool help_requested = false;
+  if (!parse_args(argc, argv, args, help_requested))
+    return help_requested ? 0 : 2;
 
-  auto [objs, max_size] = discover_objects(args.host, args.port, args.bucket, args.objects);
+  auto [objs, max_size] = discover_objects(args.host, args.port, args.bucket, args.objects, args.proto);
 
   s3rdma::BufferMode mode = s3rdma::parse_mode(args.mode);
   const int N = args.threads;
@@ -353,7 +386,7 @@ int main(int argc, char** argv) {
 
   auto [results, bufs, clients, alloc_ms] =
       setup_buffers_clients(mode, max_size, N, args.host, args.port,
-                            args.mode);
+                            args.mode, args.proto);
 
   const size_t range_size = args.range_size;
   if (range_size > 0)
