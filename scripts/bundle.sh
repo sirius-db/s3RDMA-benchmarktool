@@ -30,6 +30,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../third_party/versions.env
+. "${ROOT}/third_party/versions.env"
+if [[ "${CUOBJ_VERSION}" != "1.0.0" || "${CUFILE_VERSION}" != "1.16" ]]; then
+  echo "bundle: this SDK profile is unsupported; build and run it in place" >&2
+  exit 1
+fi
 ENVLIB="${ROOT}/.pixi/envs/default/lib"
 DIST="${ROOT}/dist"
 CUFILE116="${ROOT}/third_party/cufile-1.16"  # matched cufile for the client

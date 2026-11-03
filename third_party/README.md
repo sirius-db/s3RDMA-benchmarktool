@@ -10,8 +10,7 @@ into the source tree.
 
 ## What lands here
 
-`scripts/fetch_sdk.sh` populates the exact layout that `scripts/configure.sh` and
-`scripts/bundle.sh` expect:
+`scripts/fetch_sdk.sh` populates the staging layout below. `scripts/configure.sh` uses the cuObject extract. The legacy deployment bundler still expects cuFile 1.16 and does not support the new 1.3.1 profile.
 
 ```
 third_party/
@@ -33,9 +32,7 @@ are not baked in. Choose one:
    pixi run fetch-sdk
    ```
 
-2. **Use an existing install:** point `CUOBJ_SDK_ROOT` at an already-unpacked SDK
-   tree (e.g. a system CUDA install that includes cuObject). `configure.sh` and
-   `bundle.sh` honor `CUOBJ_SDK_ROOT` and skip this directory.
+2. **Use an existing install:** point `CUOBJ_SDK_ROOT` at an SDK extract, CUDA toolkit root or staged `include`/`lib` prefix. This skips SDK downloads and selects cuObject for configuration. Select a matching CUDA/cuFile build environment separately.
 
 If neither is set, the build falls back to the system cuObject install (see
 `scripts/configure.sh`).

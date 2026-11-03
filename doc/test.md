@@ -14,11 +14,15 @@ Both nodes need CX-6 (or later) RoCEv2 NICs on the same L2 subnet.
 
 ## Version alignment
 
-cuObject client lib must match cufile/GDS. The build uses **cuObject 1.0.0**
-paired with **cufile 1.16** (`third_party/`). See `scripts/configure.sh` and
-`scripts/bundle.sh`.
+The rig profile targets cuObject client 1.3.1, distributed with CUDA 13.4.1. Use a matching cuFile package; the conda-forge 1.3.1.55 client requires `libcufile >=1.19.1.55,<1.20.0a0`. `CUFILE_VERSION=1.19` names the staging directory.
+
+For an existing toolkit, set `CUOBJ_SDK_ROOT` to its root and `S3RDMA_BUILD_SERVER=OFF` in the environment of each build invocation. This selects cuObject; align the CUDA/cuFile toolchain separately. With no explicit root, `configure.sh` prefers the staged SDK when present, otherwise CMake's default search. Use a fresh build directory when changing SDK or toolkit inputs, and record the resolved header and loaded-library identities before running the probe.
+
+This profile is built and run in place; the legacy bundle/deploy procedure below has not been updated for it. The recorded performance results below predate this profile and do not qualify it.
 
 ## Deploy (from the build host)
+
+This procedure applies to the earlier cuObject 1.0.0 / cuFile 1.16 profile. Do not use it for the 1.3.1 rig build or with `S3RDMA_BUILD_SERVER=OFF`; run those binaries on the build host.
 
 ```bash
 export PATH="$HOME/.pixi/bin:$PATH"
