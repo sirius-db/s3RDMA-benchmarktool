@@ -198,3 +198,39 @@ hardware-phase increment.
 - Archive the exact commands, the environment fingerprint (NIC/GPU/driver and
   the loaded cuObject/cuFile library versions), and a redacted pcap with each
   report.
+
+## Rig-preflight experiments
+
+`cuobj_rig_probe` keeps concurrent and lifecycle measurements separate from
+the serial `cuobj_scope_probe`. Archive the exact command, SDK/library
+identity, fixture manifest, effective configuration, JSONL and process status.
+Apply the approved memory/traffic limits and a bounded parent/wrapper to
+every case. Watchdog termination is abnormal evidence.
+
+| `--exp` | Measurement and qualification |
+|---|---|
+| `attr` | Record ordering/flush attributes and query failures. This is observational; it does not qualify the flush path. |
+| `reg` | Measure base/last-slot callback capacity on the recorded GPU allocation. Refuse an insufficient bound; never clamp S. Qualify other allocation/interior-pointer profiles separately. |
+| `diag` | Correlate request, callback, parsed-header, SDK-return and authorized landing evidence. Parsed headers are observations only: with no byte-preserving authority source, every submitted GET currently stays **unknown** (retained, not read, not released), so completion-dependent actions — injection, landing reads, ordinary release, C/exit qualification — are held, not just a reporting column. Keep request length separate from expected landing length (`--expected-bytes`), including both EOF cases. Missing evidence remains an explicit gap; no digest means no verified-delivery PASS. Raw header bytes are **not yet captured** (`raw_reply_available=false`); that leg stays unqualified. |
+| `rt-guard` | Inject only after a qualified complete transfer. Later invocations emit nothing. Primary PASS needs intentional re-invocation, a qualified count of one token-bearing message and a negative SDK return — Completion authority is currently unavailable, so submitted GETs stop at INCONCLUSIVE with retention before injection. The qualified emission count is also unavailable. Run non-retryable and retry-disabled controls separately with an independently inspected configuration receipt. `rdma_io_retry_count_observed` is an unqualified substring observation (`retry_configuration_qualified=false`). Ordered re-invocation of the same request also remains unqualified. |
+| `c` | One registrar and one session per worker; do not share a session. Qualify the actual guarded layout, complete poison production, and validate every GET before reuse. Record distinct entered-GET overlap and all per-GET checks. No overlap is INCONCLUSIVE. The reference oracle is relative to verified serial reads from the same endpoint. |
+| `exit` | Establish a known-complete GET, then retain the graph through normal return from main. Record the bounded parent result and a separate post-run health check. The labelled `_exit` variant is an abrupt observation, not normal-exit qualification. |
+
+Unknown completion stops further submissions and reuse. Read neither payload
+nor guards and perform no ordinary deregistration/free. Use only the approved
+isolated-child lifetime and peer/process cleanup boundary; otherwise that arm
+is NOT RUN. A timeout or later healthy probe is not a drain proof.
+
+Run `./build/probe/cuobj_loader_harness --order cufile-first` and
+`--order cuobj-first` in fresh processes. Preserve startup, load,
+constructor (via `libcuobj_loader_fixture.so`), binding and mapped-identity
+receipts. Both orders must show one cuFile object while the client is alive
+and supply the required binding receipts. The harness currently reports
+PARTIAL (exit 4) because symbol-origin evidence is unavailable; loader
+qualification remains pending.
+
+For a compatible gateway, use `--gateway` and the configured `--region`;
+credentials come from the AWS environment variables. Keep count bases
+explicit: callback, attempt, emission and capture are different evidence.
+These diagnostics do not replace the stock benchmark's integrity, profile,
+complete-log and zero-worker-failure eligibility rules.
