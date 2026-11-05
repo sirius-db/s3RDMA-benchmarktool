@@ -30,6 +30,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <functional>
 #include <thread>
 #include <vector>
 
@@ -38,10 +39,12 @@
 
 #include <cuda_runtime.h>
 #include <cuobjclient.h>
-#include <httplib.h>
 
 #include "buffers.hpp"
 #include "jsonl.hpp"
+#include "completion_authority.hpp"
+#include "guard_witness.hpp"
+#include "raw_http.hpp"
 #include "s3_protocol.hpp"
 #include "s3_util.hpp"
 #include "sha256.hpp"
@@ -77,6 +80,25 @@ long long now_ns() {
              std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// Diagnostic emission that can never escape: an allocation or output failure
+// while reporting latches the evidence/output failure instead of unwinding.
+template <class F>
+void report(F&& f) noexcept {
+  try { f(); } catch (...) { s3rdma::jsonl_output_failed() = true; }
+}
+
+// Fallback after a reporting failure: preserve non-PASS readings; mark a
+// candidate PASS as INCONCLUSIVE and return 3.
+int terminal_fallback(Verdict v) noexcept {
+  s3rdma::jsonl_output_failed() = true;
+  if (v == Verdict::Pass) v = Verdict::Inconclusive;  // same incomplete-output ceiling as finish()
+  std::fputs("{\"event\":\"result\",\"verdict\":\"", stdout);
+  std::fputs(verdict_name(v), stdout);
+  std::fputs("\",\"detail\":\"terminal reporting failed after the reading was selected\",\"evidence_output_failed\":true}\n", stdout);
+  std::fflush(stdout);
+  return 3;
+}
+
 int finish(Verdict v, const std::string& detail) {
   if (s3rdma::jsonl_output_failed() && v == Verdict::Pass) v = Verdict::Inconclusive;
   Rec("result").str("verdict", verdict_name(v)).str("detail", detail)
@@ -87,6 +109,7 @@ int finish(Verdict v, const std::string& detail) {
 constexpr size_t kMaxReg = 4ULL * 1024 * 1024 * 1024 - 64 * 1024;  // CUOBJ_MAX_MEMORY_REG_SIZE
 constexpr size_t kSsizeMax = static_cast<size_t>(std::numeric_limits<ssize_t>::max());
 constexpr size_t kMaxBody = 64 * 1024;  // an unexpected HTTP body is evidence, not payload
+constexpr size_t kMaxHead = 64 * 1024;
 
 bool checked_add(size_t a, size_t b, size_t& out) {
   if (a > std::numeric_limits<size_t>::max() - b) return false;
@@ -297,7 +320,18 @@ struct Attempt {
   int http_status = 0;
   std::string transport_error, request_error;
   bool reply_present = false, reply_unambiguous = false;
-  std::string reply_parsed, reply_kind;
+  std::string reply_raw, reply_kind;       // reply_raw = exact field bytes (OWS-trimmed), never decoded
+  bool head_complete = false, head_malformed = false, request_partial = false, body_truncated = false;
+  bool message_complete = false;   // whole HTTP response received and well framed
+  bool entered_while_active = false;
+  std::thread::id thread;            // identity used by the witness
+  unsigned long long thread_id = 0;  // hash, diagnostic only
+  long long body_octets = 0;
+  bool probe_failure = false;      // request could not be built/sent by the probe itself (nothing token-bearing emitted)
+  std::string framing;
+  long long reply_count = 0, count_field_count = 0, request_bytes = 0;
+  bool count_plain = false;                // count field present once with a plain decimal spelling
+  std::string response_head;               // exact response head bytes
   int reply_code = 0;
   bool content_range_present = false;
   std::string content_range;
@@ -306,7 +340,7 @@ struct Attempt {
   long long body_bytes = 0, cb_size = 0, cb_offset = 0;
   long long natural_return = 0, returned = 0;
   bool injection_applied = false;
-  bool qualified_complete = false;   // authority — currently never true (no byte-preserving source)
+  bool qualified_complete = false;   // authority from the validated raw receipt
   bool completion_candidate = false; // parsed/canonical candidate, diagnosis only
 };
 
@@ -319,9 +353,14 @@ struct RigContext {
   bool guard = false;
   long first_return = 0;
   std::atomic<int> invocations{0};
-  std::atomic<int> http_attempts{0};
+  std::atomic<int> http_attempts{0};   // complete, validated, token-bearing request messages written
+  std::atomic<int> partial_messages{0};  // incomplete writes only
+  std::atomic<int> tokenless_messages{0};
+  std::atomic<int> active{0};            // callbacks of this context currently inside the probe
+  std::mutex entry_mu;                   // makes invocation number and overlap observation one coherent step
+  std::atomic<bool> local_failure{false};  // a probe-origin failure happened in this context
   std::atomic<int> submitted{0};   // set before the HTTP call: a request may be on the wire from here on
-  std::atomic<int> completed{0};   // advanced only by a qualified completion receipt (currently never)
+  std::atomic<int> completed{0};   // advanced only by a qualified completion receipt
   std::atomic<int> responses{0};
   std::atomic<bool> unknown{false};        // a possibly effective submission without completion proof
   std::atomic<bool> evidence_lost{false};  // a record could not be kept
@@ -337,27 +376,7 @@ struct RigContext {
   }
 };
 
-// A transfer is complete only when the endpoint said so: matching status pair,
-// a reply code equal to the status, and a declared count equal to the expected
-// landing length (legacy fake-S3: 200/206 reports the requested size).
-bool qualified_complete(const Attempt& a, const s3rdma::ProtocolOptions& proto, size_t expected, size_t requested) {
-  if (!a.response || (a.http_status != 200 && a.http_status != 206)) return false;
-  if (a.reply_kind != "code") return false;  // a declined, absent or malformed tag never completes
-  if (!a.count_present || a.declared < 0 || static_cast<size_t>(a.declared) != expected) return false;
-  // Candidate conventions: shipped fake-S3 answers reply "200" for both 200 and 206; the standard contract pairs reply with status.
-  const bool status_ok = proto.token_encoding == s3rdma::TokenEncoding::Base64
-                             ? (a.reply_code == 200 && expected == requested)
-                             : a.reply_code == a.http_status;
-  // The header values available here are httplib-transformed (percent escapes
-  // are decoded before we see them), so they are observations only. Until a
-  // byte-preserving, unambiguous authority source exists, no possibly effective
-  // submission is treated as complete: the parsed candidate is recorded in
-  // `completion_candidate`, and the callback keeps the context unknown.
-  (void)status_ok;
-  return false;
-}
-
-// Parsed status/count candidate for diagnosis; provenance and uniqueness remain unqualified.
+// Parsed status/count candidate for diagnosis; it does not check receipt framing, provenance or field uniqueness.
 bool completion_candidate(const Attempt& a, const s3rdma::ProtocolOptions& proto, size_t expected, size_t requested) {
   if (!a.response || (a.http_status != 200 && a.http_status != 206)) return false;
   if (a.reply_kind != "code" || !a.count_present || a.declared < 0 || static_cast<size_t>(a.declared) != expected) return false;
@@ -369,9 +388,16 @@ ssize_t rig_callback_impl(const void* handle, char* ptr, size_t size, loff_t off
                           const cufileRDMAInfo_t* rdma) {
   (void)ptr;
   auto* ctx = static_cast<RigContext*>(cuObjClient::getCtx(handle));
-  if (ctx == nullptr || rdma == nullptr || ctx->proto == nullptr) return -ENOTSUP;
+  if (ctx == nullptr) return -ENOTSUP;
   Attempt at;
-  at.invocation = ctx->invocations.fetch_add(1);
+  {
+    std::lock_guard<std::mutex> lk(ctx->entry_mu);  // coherent: ordinal and overlap flag from one critical section
+    at.invocation = ctx->invocations.fetch_add(1);
+    at.entered_while_active = ctx->active.fetch_add(1) > 0;  // released by the wrapper's Leave guard
+  }
+  at.thread = std::this_thread::get_id();
+  at.thread_id = static_cast<unsigned long long>(std::hash<std::thread::id>{}(at.thread));
+  if (rdma == nullptr || ctx->proto == nullptr) return -ENOTSUP;
   at.t_begin = now_ns();
   at.cb_size = static_cast<long long>(size);
   at.cb_offset = static_cast<long long>(offset);
@@ -388,71 +414,98 @@ ssize_t rig_callback_impl(const void* handle, char* ptr, size_t size, loff_t off
 
   const s3rdma::ProtocolOptions& proto = *ctx->proto;
   std::string target;
-  httplib::Headers headers;
+  s3rdma::HeaderList headers;  // sent in this order, byte for byte
   try {
     const std::string token =
         s3rdma::encode_rdma_token(rdma->desc_str, rdma->desc_len, proto.token_encoding);
     target = s3rdma::control_plane_target(proto, ctx->path);
-    for (auto& h : s3rdma::control_plane_headers(proto, "GET",
-                                                 s3rdma::http_host_header(ctx->host, ctx->port),
-                                                 ctx->path, ctx->range, token))
-      headers.emplace(h.first, h.second);
+    headers = s3rdma::control_plane_headers(proto, "GET", s3rdma::http_host_header(ctx->host, ctx->port),
+                                            ctx->path, ctx->range, token);
   } catch (const std::exception& e) {
     at.request_error = e.what();
+    at.probe_failure = true;
+    ctx->local_failure.store(true);
     at.returned = -ENOTSUP;  // nothing was sent; do not let the library retry
     at.t_end = now_ns();
     ctx->push(at);
     return -ENOTSUP;
   }
 
-  httplib::Client cli(ctx->host, ctx->port);
-  cli.set_follow_location(false);
-  at.http_attempt = true;
-  ctx->http_attempts.fetch_add(1);
-  // From this point any exception means "sent, completion unknown" until a
-  // qualified receipt is durably recorded (see completed below).
+  // Submission state is established before the network call: from here on an
+  // exception means "possibly sent, completion unknown" until a qualified
+  // receipt is recorded. A connect failure that wrote nothing is taken back.
   ctx->submitted.fetch_add(1);
   ctx->unknown.store(true);
-  long long body = 0;
-  auto res = cli.Get(target, headers, [&](const char*, size_t n) {
-    body += static_cast<long long>(n);
-    return body <= static_cast<long long>(kMaxBody);
-  });
-  at.body_bytes = body;
-  ssize_t rc = -ENOTSUP;
-  if (!res) {
-    at.transport_error = httplib::to_string(res.error());
+  s3rdma::RawResponse res;
+  try {
+    res = s3rdma::raw_http_get(ctx->host, ctx->port, s3rdma::http_host_header(ctx->host, ctx->port), target,
+                               headers, kMaxHead, kMaxBody, 30);
+  } catch (const std::invalid_argument& e) {  // request validation: nothing was written
+    at.request_error = e.what();
+    at.probe_failure = true;
+    ctx->local_failure.store(true);
+    ctx->submitted.fetch_sub(1);
+    if (ctx->submitted.load() == ctx->completed.load()) ctx->unknown.store(false);
+    at.returned = -ENOTSUP;
+    at.t_end = now_ns();
+    ctx->push(at);
+    return -ENOTSUP;
+  }
+  at.request_partial = res.request_partial;
+  at.request_bytes = static_cast<long long>(res.request_bytes);
+  if (!res.request_sent && !res.request_partial) {
+    ctx->submitted.fetch_sub(1);  // no request bytes were accepted by the socket
+    if (ctx->submitted.load() == ctx->completed.load()) ctx->unknown.store(false);
+    if (res.transport_error) { at.probe_failure = true; ctx->local_failure.store(true); }
+  } else if (res.request_sent && res.token_bearing) {
+    at.http_attempt = true;
+    ctx->http_attempts.fetch_add(1);  // one complete, validated, token-bearing message
+  } else if (res.request_sent) {
+    ctx->tokenless_messages.fetch_add(1);  // complete but not token-bearing
   } else {
+    ctx->partial_messages.fetch_add(1);  // incomplete write: possibly emitted, never a counted message
+  }
+  at.body_bytes = static_cast<long long>(res.body_content);   // decoded content
+  at.body_octets = static_cast<long long>(res.body_octets);   // retained wire octets after the head
+  at.body_truncated = res.body_truncated;
+  at.head_complete = res.head_complete;
+  at.head_malformed = res.head_malformed;
+  at.message_complete = res.message_complete;
+  at.framing = res.framing;
+  at.response_head = res.head_bytes;
+  if (res.transport_error) at.transport_error = res.error;
+  const s3rdma::ReceiptView view = s3rdma::view_receipt(res, size);
+  ssize_t rc = -ENOTSUP;
+  if (view.present) {
     at.response = true;
     ctx->responses.fetch_add(1);
-    at.http_status = res->status;
-    at.reply_present = res->has_header(s3rdma::kHdrRdmaReply);
-    at.reply_parsed = at.reply_present ? res->get_header_value(s3rdma::kHdrRdmaReply) : "";
-    const s3rdma::RdmaReply reply = s3rdma::parse_rdma_reply(at.reply_present, at.reply_parsed);
+    at.http_status = view.status;
+    at.reply_count = static_cast<long long>(view.reply_count);
+    at.reply_present = view.reply_count > 0;
+    at.reply_raw = view.reply_raw;
+    const s3rdma::RdmaReply reply = s3rdma::parse_rdma_reply(at.reply_present, at.reply_raw);
     at.reply_kind = reply.kind == s3rdma::RdmaReply::Kind::Code ? "code"
                     : reply.kind == s3rdma::RdmaReply::Kind::Declined ? "declined" : "malformed";
     at.reply_code = reply.code;
-    // Canonical candidate property only: the HTTP layer has already decoded
-    // percent escapes, so plain spelling here says nothing about the wire bytes.
-    at.reply_unambiguous = at.reply_present && res->get_header_value_count(s3rdma::kHdrRdmaReply) == 1 &&
-                           at.reply_parsed == std::to_string(reply.code);
-    at.content_range_present = res->has_header("Content-Range");
-    at.content_range = at.content_range_present ? res->get_header_value("Content-Range") : "";
-    at.count_present = res->has_header(s3rdma::kHdrRdmaBytesTransferred);
-    at.declared = s3rdma::parse_rdma_bytes_transferred(
-        at.count_present, at.count_present ? res->get_header_value(s3rdma::kHdrRdmaBytesTransferred) : "",
-        size);
+    at.reply_unambiguous = view.reply_plain;
+    const s3rdma::RawField* cr = res.first("content-range");
+    at.content_range_present = cr != nullptr;
+    at.content_range = cr ? cr->value : "";
+    at.count_field_count = static_cast<long long>(view.count_count);
+    at.count_present = view.count_count > 0;
+    at.count_plain = view.count_plain;
+    at.declared = view.declared;
     // Legacy Base64 preserves the historical requested-size return.
     // Verbatim responses require matching status and use the declared count.
-    if (res->status == 200 || res->status == 206) {
+    if (res.status == 200 || res.status == 206) {
       if (proto.token_encoding == s3rdma::TokenEncoding::Base64) rc = static_cast<ssize_t>(size);
-      else if (reply.kind == s3rdma::RdmaReply::Kind::Code && reply.code == res->status && at.declared >= 0)
+      else if (reply.kind == s3rdma::RdmaReply::Kind::Code && reply.code == res.status && at.declared >= 0)
         rc = static_cast<ssize_t>(at.declared);
     }
   }
   at.natural_return = rc;
   at.completion_candidate = completion_candidate(at, proto, ctx->expected, size);
-  at.qualified_complete = qualified_complete(at, proto, ctx->expected, size);
+  at.qualified_complete = s3rdma::completion_authority(view, proto, ctx->expected, size);
   if (at.qualified_complete && ctx->submitted.load() == 1) {
     ctx->completed.fetch_add(1);
     ctx->unknown.store(false);  // the single submission has a qualified receipt
@@ -471,6 +524,12 @@ ssize_t rig_callback_impl(const void* handle, char* ptr, size_t size, loff_t off
 // Nothing may leave the callback through the SDK's frames.
 ssize_t rig_callback(const void* handle, char* ptr, size_t size, loff_t offset,
                      const cufileRDMAInfo_t* rdma) noexcept {
+  struct Leave {  // the context's active-depth is released only when the probe has finished with this callback
+    const void* h;
+    ~Leave() noexcept {
+      if (auto* c = static_cast<RigContext*>(cuObjClient::getCtx(h))) c->active.fetch_sub(1);
+    }
+  } leave{handle};
   try {
     return rig_callback_impl(handle, ptr, size, offset, rdma);
   } catch (...) {
@@ -490,16 +549,23 @@ void emit_attempts(const RigContext& ctx, const std::string& label) {
     Rec("attempt").str("run_id", ctx.run_id).num("get_id", ctx.get_id).str("case", label).str("who", ctx.who)
         .num("iteration", ctx.iteration).num("slot", ctx.slot).num("invocation", a.invocation)
         .num("t_begin_ns", a.t_begin).num("t_end_ns", a.t_end)
-        .boolean("guarded", a.guarded).str("count_basis", a.guarded ? "none" : "http_attempt")
+        .boolean("guarded", a.guarded).str("count_basis", a.guarded ? "none" : "request_message")
         .boolean("http_attempt", a.http_attempt).boolean("response", a.response)
         .num("http_status", a.http_status).str("transport_error", a.transport_error)
         .str("request_error", a.request_error).num("body_bytes", a.body_bytes)
-        .boolean("reply_present", a.reply_present).boolean("raw_reply_available", false)
-        .str("reply_parsed", a.reply_parsed).hex("reply_parsed_hex", a.reply_parsed)
+        .boolean("reply_present", a.reply_present).boolean("raw_reply_available", a.response)
+        .boolean("head_complete", a.head_complete).boolean("head_malformed", a.head_malformed)
+        .boolean("message_complete", a.message_complete).str("framing", a.framing).boolean("probe_failure", a.probe_failure)
+        .num("request_bytes", a.request_bytes).boolean("request_partial", a.request_partial)
+        .hex("response_head_hex", a.response_head)
+        .str("reply_raw", a.reply_raw).hex("reply_raw_hex", a.reply_raw).num("reply_count", a.reply_count)
+        .num("count_field_count", a.count_field_count).boolean("count_plain", a.count_plain)
+        .boolean("body_truncated", a.body_truncated)
         .str("reply_kind", a.reply_kind).num("reply_code", a.reply_code).boolean("reply_unambiguous", a.reply_unambiguous)
         .boolean("content_range_present", a.content_range_present).str("content_range", a.content_range)
         .boolean("count_present", a.count_present).num("bytes_transferred_declared", a.declared)
-        .num("cb_size", a.cb_size).num("cb_offset", a.cb_offset)
+        .num("cb_size", a.cb_size).num("cb_offset", a.cb_offset).num("body_content", a.body_bytes).num("body_octets", a.body_octets)
+        .boolean("entered_while_active", a.entered_while_active).num("thread_id", static_cast<long long>(a.thread_id))
         .num("natural_return", a.natural_return).boolean("injection_applied", a.injection_applied)
         .num("callback_return", a.returned).boolean("qualified_complete", a.qualified_complete)
         .boolean("completion_candidate", a.completion_candidate)
@@ -711,13 +777,15 @@ class Fixture {
     return rc;
   }
 
-  // Checked release through the registrar. Any failure leaves the graph retained.
+  // Checked release through the registrar. Deregistration failure retains the
+  // graph; diagnostic failure only marks the receipt incomplete.
   bool release() {
     if (released_ || retained_) return false;
     int drc = 0;
     if (registered_) drc = sessions_[0]->deregister_memory(arena_->data());
-    Rec("deregister").num("rc", drc).boolean("attempted", registered_).emit();
-    if (drc != 0) { retain_now(); return false; }
+    if (drc != 0) retain_now();  // decided before the report; a throwing report cannot undo it
+    try { Rec("deregister").num("rc", drc).boolean("attempted", registered_).emit(); } catch (...) { s3rdma::jsonl_output_failed() = true; }
+    if (drc != 0) return false;
     registered_ = false;
     released_ = true;
     sessions_.clear();
@@ -827,21 +895,37 @@ int exp_single_get(const Options& o, bool guard, const std::string& run_id) {
   }
   const bool digest_checked = !o.expect_sha.empty();
   const bool digest_ok = digest_checked && digest == o.expect_sha;
+  // Compare the observed landing with the fresh poison over the same span.
+  const std::string poison_span = g.expected ? payload_poison_digest(cell, g.expected, nonce) : "";
   Rec("landing").str("run_id", run_id).num("get_id", ctx.get_id).str("case", o.label).str("sha256", digest).boolean("digest_checked", digest_checked)
-      .boolean("digest_ok", digest_ok).boolean("poison_intact_outside", outside_ok).emit();
+      .boolean("digest_ok", digest_ok).boolean("poison_intact_outside", outside_ok)
+      .str("poison_span_sha256", poison_span).boolean("landing_is_poison", g.expected > 0 && digest == poison_span).emit();
   if (!fx.release()) return fx.retain(o.label, Verdict::Fail, "deregistration failed; arena retained");
 
   if (ctx.evidence_lost.load())
     return finish(Verdict::Inconclusive, "evidence incomplete (a callback record was lost)");
   if (guard) {
     const bool injected = !ctx.attempts.empty() && ctx.attempts.front().injection_applied;
+    const bool landing_poison = g.expected > 0 && digest == poison_span;
     if (!injected) return finish(Verdict::Inconclusive, "first transfer not qualified complete; guard not exercised");
-    if (ctx.invocations.load() < 2) return finish(Verdict::Inconclusive, "guard not exercised: the library did not re-invoke the callback");
-    if (ctx.http_attempts.load() != 1) return finish(Verdict::Fail, "more than one HTTP attempt for one GET");
+    if (ctx.invocations.load() < 2)
+      return finish(Verdict::Inconclusive, landing_poison ? "no re-entry; landing_unchanged_poison_after_injected_return"
+                                                          : "guard not exercised: the library did not re-invoke the callback");
+    std::vector<s3rdma::GuardAttempt> ga;
+    for (auto& a : ctx.attempts)
+      ga.push_back({a.invocation, a.t_begin, a.t_end, a.cb_size, a.cb_offset, a.injection_applied, a.guarded, a.http_attempt, a.request_partial, a.entered_while_active, a.thread});
+    const s3rdma::GuardWitness w = s3rdma::guard_witness(ga);
+    Rec("guard_witness").boolean("ok", w.ok).str("why", w.why).num("messages", ctx.http_attempts.load())
+        .num("partial_messages", ctx.partial_messages.load()).num("tokenless_messages", ctx.tokenless_messages.load())
+        .str("ordering_basis", "same-thread non-nested callback execution + strict return-marker order").emit();
+    if (ctx.http_attempts.load() > 1) return finish(Verdict::Fail, "more than one request message for one GET");
     if (r.present && r.value >= 0) return finish(Verdict::Fail, "cuObjGet returned success after injected failure");
     if (!outside_ok) return finish(Verdict::Fail, "guard corruption after the completed transfer");
-    if (!digest_ok) return finish(Verdict::Inconclusive, digest_checked ? "supplied digest did not match" : "no integrity witness supplied");
-    return finish(Verdict::Inconclusive, "guard exercised; emitted token-bearing request count is unqualified");
+    if (!w.ok) return finish(Verdict::Inconclusive, "re-entry witness not established: " + w.why);
+    if (landing_poison) return finish(Verdict::Inconclusive, "re-entry witnessed; landing_unchanged_poison_after_injected_return");
+    if (!digest_checked) return finish(Verdict::Inconclusive, "re-entry witnessed; no integrity witness supplied");
+    if (!digest_ok) return finish(Verdict::Inconclusive, "re-entry witnessed; landing did not match the independent object digest");
+    return finish(Verdict::Pass, "ordered re-entry of the same request; one complete token-bearing message; negative SDK return; landing verified (capture is the independent cross-check)");
   }
   const bool one_cb = ctx.invocations.load() == 1;
   const bool rc_ok = r.present && r.value == static_cast<ssize_t>(g.expected);
@@ -932,6 +1016,8 @@ int exp_concurrent(const Options& o, const std::string& run_id) {
           .boolean("unknown", ctx.unknown.load()).boolean("evidence_complete", !ctx.evidence_lost.load()).emit();
       if (ctx.unknown.load() || ctx.evidence_lost.load() || !r.present || ctx.completed.load() != ctx.submitted.load())
         return retain_all(Verdict::Inconclusive, "reference GET left completion unknown; graph retained");
+      if (ctx.local_failure.load())  // joint hold is clear: nothing of this GET is outstanding
+        return release_or_retain(Verdict::EnvError, "probe-origin failure during the reference pass (not a backend finding)");
       bool outside = false;
       std::string d;
       const bool ok = slot_ok(k, ctx, r, nonce, d, outside);
@@ -1008,43 +1094,96 @@ int exp_concurrent(const Options& o, const std::string& run_id) {
       // evidence failure, not a backend finding.
       bool observed_failure = false, evidence_failure = false;
       for (size_t k = 0; k < W; ++k) {
-        if (ctxs[k].evidence_lost.load()) { evidence_failure = true; continue; }
+        if (ctxs[k].evidence_lost.load() || ctxs[k].local_failure.load()) { evidence_failure = true; continue; }
         observed_failure |= rcs[k].present && rcs[k].value != static_cast<ssize_t>(S);
       }
       const bool concurrent_failure = observed_failure && round_max >= 2;  // this round's overlap only
-      return retain_all(concurrent_failure ? Verdict::Fail : Verdict::Inconclusive,
-                        concurrent_failure ? "a GET returned short/negative under witnessed overlap; graph retained"
+      const Verdict selected = concurrent_failure ? Verdict::Fail : Verdict::Inconclusive;  // selected before reporting
+      const char* why = concurrent_failure ? "a GET returned short/negative under witnessed overlap; graph retained"
                         : observed_failure ? "observed short/negative return without witnessed overlap (G8 INCONCLUSIVE); graph retained"
                         : evidence_failure ? "probe evidence failure (record lost); not a backend finding; graph retained"
-                                           : "a GET left completion unknown; no reuse; graph retained");
+                                           : "a GET left completion unknown; no reuse; graph retained";
+      try { return retain_all(selected, why); } catch (...) { return terminal_fallback(selected); }
     }
 
+    bool local_in_round = false, observer_failed = false;
+    std::vector<bool> native_fail(W, false);
+    // Pass 1 (no reads): independently eligible native-return failures are
+    // classified before any landing observation can fail.
+    for (size_t k = 0; k < W; ++k) {
+      if (ctxs[k].local_failure.load()) continue;
+      const bool native_ok = rcs[k].present && rcs[k].value == static_cast<ssize_t>(S) && ctxs[k].invocations.load() == 1 &&
+                             !ctxs[k].attempts.empty() && ctxs[k].attempts.front().qualified_complete;
+      native_fail[k] = !native_ok;
+      if (!native_ok) {
+        ++failures;  // decided before any allocating report
+        report([&] {
+          Rec("slot_native_failure").str("run_id", run_id).num("get_id", ctxs[k].get_id).num("iteration", it)
+              .num("slot", static_cast<long long>(k)).boolean("sdk_return_present", rcs[k].present).num("rc", rcs[k].value).emit();
+        });
+      }
+    }
     try {
       for (size_t k = 0; k < W; ++k) {
+        if (ctxs[k].local_failure.load()) {  // probe-origin: excluded from backend/payload candidates
+          local_in_round = true;
+          Rec("slot").str("run_id", run_id).num("get_id", ctxs[k].get_id).num("iteration", it).num("slot", static_cast<long long>(k))
+              .boolean("probe_failure", true).boolean("ok", false).emit();
+          continue;
+        }
         bool outside = false;
         std::string d;
         const bool ok = slot_ok(k, ctxs[k], rcs[k], nonce, d, outside) && d == ref[k];
-        if (!ok) ++failures;
+        if (!ok && !native_fail[k]) ++failures;  // payload/guard failure; pass 1 already counted this slot otherwise
         Rec("slot").str("run_id", run_id).num("get_id", ctxs[k].get_id).num("iteration", it).num("slot", static_cast<long long>(k))
             .boolean("sdk_return_present", rcs[k].present).num("rc", rcs[k].value)
             .str("sha256", d).str("expected_sha256", ref[k]).boolean("digest_ok", d == ref[k]).boolean("poison_intact_outside", outside)
             .num("callbacks", ctxs[k].invocations.load()).boolean("ok", ok).emit();
       }
     } catch (const std::exception& e) {
-      return retain_all(Verdict::EnvError, std::string("landing read failed: ") + e.what());
+      observer_failed = true;  // decided first; the report below cannot unwind
+      report([&] { Rec("observer_failure").num("iteration", it).str("what", e.what()).emit(); });
+    } catch (...) {
+      observer_failed = true;
+      s3rdma::jsonl_output_failed() = true;
     }
     if (failures) { failing_round_overlap = round_max; break; }  // do not reuse slots after a correctness failure
+    if (observer_failed) return retain_all(Verdict::EnvError, "landing observation failed; no independent failure established; graph retained");
+    if (local_in_round) {  // no independent failure: a pure probe failure ends the arm without a backend claim
+      Rec("round_probe_failure").num("iteration", it).emit();
+      return release_or_retain(Verdict::EnvError, "probe-origin failure in a concurrent round (not a backend finding)");
+    }
   }
-  Rec("summary").num("slots", static_cast<long long>(W)).num("iterations", o.iterations)
-      .num("max_overlap", max_overlap).num("failures", static_cast<long long>(failures))
-      .num("failing_round_overlap", failing_round_overlap).emit();
-  if (failures)  // the failure is retained either way; G8 is qualified only by the failing round's overlap
-    return retain_all(failing_round_overlap >= 2 ? Verdict::Fail : Verdict::Inconclusive,
-                      failing_round_overlap >= 2 ? "per-slot correctness failure under witnessed overlap; graph retained"
-                                                 : "per-slot correctness failure without witnessed overlap (G8 INCONCLUSIVE); graph retained");
-  if (!fx.release()) return retain_all(Verdict::Fail, "deregistration failed; graph retained");
-  if (max_overlap < 2) return finish(Verdict::Inconclusive, "no overlap witnessed (max_overlap < 2)");
-  return finish(Verdict::Pass, "overlap witnessed; all slots correct against the serial references");
+  // The terminal reading is selected here, before any allocating report, so a
+  // reporting failure can never replace it (see terminal_fallback).
+  Verdict final = Verdict::Pass;
+  const char* final_detail = "overlap witnessed; all slots correct against the serial references";
+  bool keep_graph = false;
+  if (failures) {  // retained either way; G8 is qualified only by the failing round's overlap
+    keep_graph = true;
+    final = failing_round_overlap >= 2 ? Verdict::Fail : Verdict::Inconclusive;
+    final_detail = failing_round_overlap >= 2 ? "per-slot correctness failure under witnessed overlap; graph retained"
+                                              : "per-slot correctness failure without witnessed overlap (G8 INCONCLUSIVE); graph retained";
+  } else if (max_overlap < 2) {
+    final = Verdict::Inconclusive;
+    final_detail = "no overlap witnessed (max_overlap < 2)";
+  }
+  report([&] {
+    Rec("summary").num("slots", static_cast<long long>(W)).num("iterations", o.iterations)
+        .num("max_overlap", max_overlap).num("failures", static_cast<long long>(failures))
+        .num("failing_round_overlap", failing_round_overlap).emit();
+  });
+  if (!keep_graph && !fx.release()) {  // cleanup failure becomes the reading before any further report
+    keep_graph = true;
+    final = Verdict::Fail;
+    final_detail = "deregistration failed; graph retained";
+  }
+  try {
+    if (keep_graph) return retain_all(final, final_detail);
+    return finish(final, final_detail);
+  } catch (...) {
+    return terminal_fallback(final);
+  }
 }
 
 int exp_exit_child(const Options& o, const std::string& run_id) {
@@ -1169,11 +1308,17 @@ int main(int argc, char** argv) {
     if (!validate_geometry(o, o.exp == "c" ? o.slots : 1, g, why)) return finish(Verdict::EnvError, why);
   }
   if (cudaSetDevice(0) != cudaSuccess) return finish(Verdict::EnvError, "cudaSetDevice(0) failed");
-  if (o.exp == "reg") return exp_reg(o);
-  if (o.exp == "diag") return exp_single_get(o, false, run_id);
-  if (o.exp == "rt-guard") return exp_single_get(o, true, run_id);
-  if (o.exp == "c") return exp_concurrent(o, run_id);
-  if (o.exp == "exit") return exp_exit_child(o, run_id);
+  try {
+    if (o.exp == "reg") return exp_reg(o);
+    if (o.exp == "diag") return exp_single_get(o, false, run_id);
+    if (o.exp == "rt-guard") return exp_single_get(o, true, run_id);
+    if (o.exp == "c") return exp_concurrent(o, run_id);
+    if (o.exp == "exit") return exp_exit_child(o, run_id);
+  } catch (...) {
+    // Report unexpected experiment exceptions without constructing another JSON record.
+    std::fputs("{\"event\":\"result\",\"verdict\":\"ENV_ERROR\",\"detail\":\"unhandled experiment exception; evidence incomplete\",\"evidence_output_failed\":true}\n", stdout);
+    return 3;
+  }
   usage(argv[0]);
   return 2;
 }

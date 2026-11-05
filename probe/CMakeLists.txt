@@ -40,10 +40,10 @@ add_executable(cuobj_rig_probe
     rig_probe_main.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../client/buffers.cpp)
 
+# The rig probe speaks HTTP through common/raw_http.hpp; no cpp-httplib.
 target_include_directories(cuobj_rig_probe PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../client
-    ${CUOBJCLIENT_INCLUDE_DIR}
-    ${HTTPLIB_INCLUDE_DIR})
+    ${CUOBJCLIENT_INCLUDE_DIR})
 
 target_link_libraries(cuobj_rig_probe PRIVATE
     s3rdma_common
