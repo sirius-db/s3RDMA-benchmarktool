@@ -467,10 +467,12 @@ class ProbeClient {
     return rc;
   }
   void deregister_memory(void* ptr) { client_->cuMemObjPutDescriptor(ptr); }
-  ssize_t get(ProbeContext* ctx, void* ptr, size_t size, int& err) {
+  static bool& base_offset_api() { static bool v = false; return v; }  // see rig probe: registered base + buf_offset
+  ssize_t get(ProbeContext* ctx, char* base, size_t offset, size_t size, int& err) {
     errno = 0;
     try {
-      const ssize_t n = client_->cuObjGet(ctx, ptr, size);
+      const ssize_t n = base_offset_api() ? client_->cuObjGet(ctx, base, size, 0, static_cast<loff_t>(offset))
+                                          : client_->cuObjGet(ctx, base + offset, size);
       err = errno;
       return n;
     } catch (const std::exception& e) {
@@ -487,7 +489,7 @@ class ProbeClient {
     return static_cast<int>(client_->cuMemObjGetRDMAToken(base, size, off, CUOBJ_GET, out));
   }
   void put_token(char* d) { client_->cuMemObjPutRDMAToken(d); }
-  ssize_t callback_max(void* ptr) { return client_->cuMemObjGetMaxRequestCallbackSize(ptr); }
+  ssize_t callback_max(char* base, size_t offset) { return client_->cuMemObjGetMaxRequestCallbackSize(base_offset_api() ? base : base + offset); }
 
  private:
   CUObjOps_t ops_{};
@@ -512,6 +514,7 @@ void usage(const char* a0) {
                "Usage: %s --exp <b0|i0|s0|si|r|p|m> --bucket <b> --object <k> [options]\n"
                "  --server <host:port>   default 127.0.0.1:8080\n"
                "  --mode <host|gpu>      default gpu\n"
+               "  --landing-api pointer|base-offset  cuObjGet form for interior landings (default pointer)\n"
                "  --xfer <bytes>         GET size (default 4194304; clipped only w/o --expect-sha)\n"
                "  --guard <bytes>        guard band per cell (default 65536)\n"
                "  --arena-bytes <bytes>  override arena size\n"
@@ -554,6 +557,10 @@ bool parse_options(int argc, char** argv, Options& o) {
     } else if (a == "--mode" && (v = next())) {
       o.mode = v;
       if (o.mode != "host" && o.mode != "gpu") return false;
+    } else if (a == "--landing-api" && (v = next())) {
+      if (std::string(v) == "base-offset") ProbeClient::base_offset_api() = true;
+      else if (std::string(v) == "pointer") ProbeClient::base_offset_api() = false;
+      else return false;
     } else if (a == "--xfer" && (v = next())) {
       if (!parse_size_arg(v, o.xfer)) return false;
     } else if (a == "--guard" && (v = next())) {
@@ -660,8 +667,11 @@ void prepare_slot(Buffer& arena, const Slot& slot, const std::vector<char>& pois
   fill_span(arena, slot.trail_guard, kGuardByte);
 }
 
+// `registration_origin` is the arena-relative start of the registration that
+// owns the slot (0 for whole-arena registrations; p_half for p's second half):
+// the SDK base is arena + origin and the buffer offset is slot - origin.
 GetResult issue_get(const Jsonl& log, const Options& o, ProbeClient& client,
-                    const std::string& who, Buffer& arena, const Slot& slot) {
+                    const std::string& who, Buffer& arena, const Slot& slot, size_t registration_origin = 0) {
   ProbeContext ctx;
   ctx.log = &log;
   ctx.who = who;
@@ -674,8 +684,13 @@ GetResult issue_get(const Jsonl& log, const Options& o, ProbeClient& client,
 
   GetResult g;
   g.start_ms = now_ms();
-  g.rc = client.get(&ctx, static_cast<char*>(arena.data()) + slot.payload.offset, o.xfer,
-                    g.errno_after);
+  if (slot.payload.offset < registration_origin) {
+    g.rc = -EINVAL;  // reject a negative registration-relative offset before subtraction
+    g.end_ms = now_ms();
+    return g;
+  }
+  g.rc = client.get(&ctx, static_cast<char*>(arena.data()) + registration_origin,
+                    slot.payload.offset - registration_origin, o.xfer, g.errno_after);
   g.end_ms = now_ms();
   g.callbacks = ctx.callbacks.load();
   return g;
@@ -775,9 +790,9 @@ SlotVerdict serial_get(const Jsonl& log, const Options& o, const Visibility& vis
 }
 
 // Require the SDK's per-callback max to be known and >= xfer (fail closed).
-bool callback_gate(const Jsonl& log, ProbeClient& client, void* ptr, size_t xfer,
+bool callback_gate(const Jsonl& log, ProbeClient& client, char* base, size_t offset, size_t xfer,
                    std::string& err) {
-  const ssize_t cap = client.callback_max(ptr);
+  const ssize_t cap = client.callback_max(base, offset);
   log.event("callback_max").num("bytes", static_cast<long long>(cap)).emit();
   if (cap <= 0) {
     err = "per-callback max unknown (cap<=0); cannot guarantee single-callback GET";
@@ -819,7 +834,7 @@ int main(int argc, char** argv) {
       .str("scope", "serial registration-scope x interior-landing")
       .str("concurrency", "deferred")
       .str("lifecycle", "unverified")
-      .str("deregister_rc", "not_trustworthy_sdk_1.0.0")
+      .str("deregister_rc", "lifecycle_unverified")
       .emit();
 
   const std::string path = "/" + o.bucket + "/" + o.object;
@@ -865,7 +880,7 @@ int main(int argc, char** argv) {
   Buffer arena(mode, arena_bytes);
   log.event("env")
       .str("object", o.bucket + "/" + o.object)
-      .str("mode", o.mode)
+      .str("mode", o.mode).str("landing_api", ProbeClient::base_offset_api() ? "base-offset" : "pointer")
       .num("arena_bytes", static_cast<long long>(arena_bytes))
       .num("xfer", static_cast<long long>(o.xfer))
       .num("guard", static_cast<long long>(o.guard))
@@ -883,7 +898,7 @@ int main(int argc, char** argv) {
     if (reg != 0) return result(log, Verdict::Fail, "arena registration failed");
 
     std::string gate_err;
-    if (!callback_gate(log, a, arena.data(), o.xfer, gate_err)) {
+    if (!callback_gate(log, a, static_cast<char*>(arena.data()), 0, o.xfer, gate_err)) {
       a.deregister_memory(arena.data());
       return result(log, Verdict::EnvError, gate_err);
     }
@@ -931,7 +946,7 @@ int main(int argc, char** argv) {
       return result(log, Verdict::Fail, "double registration failed");
     }
     std::string gate_err;
-    if (!callback_gate(log, a, arena.data(), o.xfer, gate_err)) {
+    if (!callback_gate(log, a, static_cast<char*>(arena.data()), 0, o.xfer, gate_err)) {
       a.deregister_memory(arena.data());
       b.deregister_memory(arena.data());
       return result(log, Verdict::EnvError, gate_err);
@@ -975,8 +990,8 @@ int main(int argc, char** argv) {
       return result(log, Verdict::Fail, "slice registration failed");
     }
     std::string gate_err;
-    if (!callback_gate(log, a, base, o.xfer, gate_err) ||
-        !callback_gate(log, b, base + p_half, o.xfer, gate_err)) {
+    if (!callback_gate(log, a, base, 0, o.xfer, gate_err) ||
+        !callback_gate(log, b, base + p_half, 0, o.xfer, gate_err)) {  // each half is its own registration base
       a.deregister_memory(base);
       b.deregister_memory(base + p_half);
       return result(log, Verdict::EnvError, gate_err);
@@ -989,8 +1004,8 @@ int main(int argc, char** argv) {
     prepare_slot(arena, sb, poison);
     if (mode == BufferMode::Gpu) CUDA_CHECK(cudaDeviceSynchronize());
     std::vector<GetResult> gets(2);
-    gets[0] = issue_get(log, o, a, "A", arena, sa);
-    gets[1] = issue_get(log, o, b, "B", arena, sb);
+    gets[0] = issue_get(log, o, a, "A", arena, sa, 0);
+    gets[1] = issue_get(log, o, b, "B", arena, sb, p_half);  // B's registration starts at p_half
     if (mode == BufferMode::Gpu) CUDA_CHECK(cudaDeviceSynchronize());
     // Verify BOTH slots' guards after BOTH GETs (catch either overrun).
     std::vector<SlotVerdict> svs(2);

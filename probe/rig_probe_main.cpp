@@ -124,6 +124,8 @@ bool checked_mul(size_t a, size_t b, size_t& out) {
 
 // ---- Options ----------------------------------------------------------------
 
+bool g_base_offset_api = false;  // --landing-api base-offset
+
 struct Options {
   std::string exp, host = "127.0.0.1", bucket, object, mode = "gpu", expect_sha, label = "diag";
   std::vector<std::string> objects;
@@ -152,6 +154,7 @@ void usage(const char* a0) {
                "  --slot-bytes <n>         S (default 8388608)\n"
                "  --slots <n>              W (default 16)\n"
                "  --guard <n>              guard band per slot (default 65536; must be > 0)\n"
+               "  --landing-api pointer|base-offset  cuObjGet form for interior landings (default pointer)\n"
                "  --range <a-b>            diag/rt-guard: inclusive request range (default 0..S-1)\n"
                "  --expected-bytes <n>     diag/rt-guard: expected landing length (default: request length)\n"
                "  --case <label>           diag: case label for the records\n"
@@ -219,6 +222,11 @@ bool parse_args(int argc, char** argv, Options& o) {
     } else if (a == "--slot-bytes" && (v = next())) { if (!parse_size(v, o.slot_bytes)) return false; }
     else if (a == "--slots" && (v = next())) { if (!parse_size(v, o.slots)) return false; }
     else if (a == "--guard" && (v = next())) { if (!parse_size(v, o.guard)) return false; }
+    else if (a == "--landing-api" && (v = next())) {
+      if (std::string(v) == "base-offset") g_base_offset_api = true;
+      else if (std::string(v) == "pointer") g_base_offset_api = false;
+      else return false;
+    }
     else if (a == "--range" && (v = next())) {
       const std::string s = v;
       const auto d = s.find('-');
@@ -598,18 +606,26 @@ class Session {
   int deregister_memory(void* ptr) {
     try { return static_cast<int>(client_->cuMemObjPutDescriptor(ptr)); } catch (...) { return -1; }
   }
-  SdkReturn get(RigContext* ctx, void* ptr, size_t size) {
+  // Landing API. "pointer": cuObjGet(ctx, base + offset, size) — the SDK looks the
+  // registration up by exact pointer, so an interior pointer misses it; for GPU
+  // memory the vendor describes the transfer then taking the bounce-buffer path
+  // (2026-11-06). Host memory shares the lookup rule.
+  // "base-offset": cuObjGet(ctx, base, size, 0, offset) — the registered base
+  // with the destination offset in buf_offset, as the vendor instructed.
+  static bool& base_offset_api() { return g_base_offset_api; }
+  SdkReturn get(RigContext* ctx, char* base, size_t offset, size_t size) {
     SdkReturn r;
     try {
-      r.value = client_->cuObjGet(ctx, ptr, size);
+      r.value = base_offset_api() ? client_->cuObjGet(ctx, base, size, 0, static_cast<loff_t>(offset))
+                                  : client_->cuObjGet(ctx, base + offset, size);
       r.present = true;
     } catch (...) {
       std::fputs("[rig] cuObjGet threw\n", stderr);
     }
     return r;
   }
-  ssize_t callback_max(void* ptr) {
-    try { return client_->cuMemObjGetMaxRequestCallbackSize(ptr); } catch (...) { return -1; }
+  ssize_t callback_max(char* base, size_t offset) {
+    try { return client_->cuMemObjGetMaxRequestCallbackSize(base_offset_api() ? base : base + offset); } catch (...) { return -1; }
   }
 
  private:
@@ -736,9 +752,10 @@ int exp_reg(const Options& o) {
   Rec("register").str("allocation", "cudaMalloc").num("bytes", static_cast<long long>(bytes)).num("rc", rc).emit();
   if (rc != 0) { cudaFree(block); return finish(Verdict::Fail, "registration of a dedicated cudaMalloc block refused"); }
   char* base = static_cast<char*>(block);
-  const ssize_t at_base = s.callback_max(base);
-  const ssize_t at_last = s.callback_max(base + (o.slots - 1) * o.slot_bytes);
+  const ssize_t at_base = s.callback_max(base, 0);
+  const ssize_t at_last = s.callback_max(base, (o.slots - 1) * o.slot_bytes);
   Rec("callback_max").num("at_base", at_base).num("at_last_slot", at_last)
+      .str("query_location", g_base_offset_api ? "registration base for both (base-offset API)" : "base and last-slot pointers")
       .num("slot_bytes", static_cast<long long>(o.slot_bytes)).num("max_reg_size", static_cast<long long>(kMaxReg)).emit();
   const int drc = s.deregister_memory(block);
   if (drc != 0) s.leak();  // retention decided before any fallible diagnostic
@@ -830,12 +847,12 @@ int exp_single_get(const Options& o, bool guard, const std::string& run_id) {
   Fixture fx(mode, cell.size, 1);
   Buffer* arena = &fx.arena();
   Session* s = &fx.session(0);
-  char* slot = static_cast<char*>(arena->data()) + cell.payload;
   const int reg = fx.register_memory();
   Rec("register").num("bytes", static_cast<long long>(cell.size)).num("rc", reg).emit();
   if (reg != 0) { fx.release(); return finish(Verdict::EnvError, "registration failed"); }
-  const ssize_t cap = s->callback_max(slot);
-  Rec("callback_max").num("at_payload", cap).num("requested", static_cast<long long>(requested)).emit();
+  const ssize_t cap = s->callback_max(static_cast<char*>(arena->data()), cell.payload);
+  Rec("callback_max").num("at_payload", cap).num("requested", static_cast<long long>(requested))
+      .str("query_location", g_base_offset_api ? "registration base" : "payload pointer").emit();
   if (cap < static_cast<ssize_t>(requested)) {
     return fx.release() ? finish(Verdict::EnvError, "callback capacity below the request: one-callback profile not available")
                         : fx.retain(o.label, Verdict::EnvError, "callback capacity below the request; release failed");
@@ -867,7 +884,7 @@ int exp_single_get(const Options& o, bool guard, const std::string& run_id) {
       .num("expected", static_cast<long long>(g.expected)).str("expected_source", o.expected_given ? "explicit" : "request_length")
       .str("rdma_io_retry_count_observed", effective_retry_count()).boolean("retry_configuration_qualified", false)
       .boolean("guard", guard).num("first_return", ctx.first_return).emit();
-  const SdkReturn r = s->get(&ctx, slot, requested);
+  const SdkReturn r = s->get(&ctx, static_cast<char*>(arena->data()), cell.payload, requested);
   emit_attempts(ctx, o.label);
   const std::string observed_class = ctx.unknown.load() ? "unknown" : (ctx.http_attempts.load() == 0 ? "no-emission" : "known-complete");
   Rec("get_end").str("run_id", run_id).num("get_id", ctx.get_id).str("case", o.label).boolean("sdk_return_present", r.present)
@@ -959,8 +976,9 @@ int exp_concurrent(const Options& o, const std::string& run_id) {
   };
   for (size_t k = 0; k < W; ++k) {
     const Cell c = make_cell(k, o.guard, S);
-    const ssize_t cap = session(k).callback_max(static_cast<char*>(arena->data()) + c.payload);
-    Rec("callback_max").num("slot", static_cast<long long>(k)).num("at_payload", cap).emit();
+    const ssize_t cap = session(k).callback_max(static_cast<char*>(arena->data()), c.payload);
+    Rec("callback_max").num("slot", static_cast<long long>(k)).num("at_payload", cap)
+        .str("query_location", g_base_offset_api ? "registration base" : "payload pointer").emit();
     if (cap < static_cast<ssize_t>(S)) {
       return release_or_retain(Verdict::EnvError, "callback capacity below S at a slot pointer");
     }
@@ -987,7 +1005,7 @@ int exp_concurrent(const Options& o, const std::string& run_id) {
   };
   auto run_slot = [&](size_t k, RigContext& ctx) {
     const Cell c = make_cell(k, o.guard, S);
-    return session(k).get(&ctx, static_cast<char*>(arena->data()) + c.payload, S);
+    return session(k).get(&ctx, static_cast<char*>(arena->data()), c.payload, S);
   };
   auto slot_ok = [&](size_t k, const RigContext& ctx, const SdkReturn& r, unsigned nonce, std::string& d, bool& outside) {
     const Cell c = make_cell(k, o.guard, S);
@@ -1208,7 +1226,7 @@ int exp_exit_child(const Options& o, const std::string& run_id) {
   ctx.path = "/" + o.bucket + "/" + o.object;
   ctx.range = "bytes=0-" + std::to_string(o.slot_bytes - 1);
   ctx.expected = o.slot_bytes;
-  const SdkReturn r = s->get(&ctx, static_cast<char*>(arena->data()) + cell.payload, o.slot_bytes);
+  const SdkReturn r = s->get(&ctx, static_cast<char*>(arena->data()), cell.payload, o.slot_bytes);
   emit_attempts(ctx, "exit-child");
   const bool complete = r.present && r.value == static_cast<ssize_t>(o.slot_bytes) && !ctx.unknown.load() &&
                         !ctx.evidence_lost.load() && ctx.invocations.load() == 1 &&
@@ -1289,7 +1307,7 @@ int main(int argc, char** argv) {
   std::string proto_error;
   if (!s3rdma::finish_protocol_options(o.proto, proto_error)) return finish(Verdict::EnvError, proto_error);
   const std::string run_id = run_identity();
-  Rec("env").str("run_id", run_id).str("exp", o.exp).str("mode", o.mode).str("server", o.host + ":" + std::to_string(o.port))
+  Rec("env").str("run_id", run_id).str("exp", o.exp).str("mode", o.mode).str("landing_api", g_base_offset_api ? "base-offset" : "pointer").str("server", o.host + ":" + std::to_string(o.port))
       .str("token_encoding", o.proto.token_encoding == s3rdma::TokenEncoding::Verbatim ? "verbatim" : "base64")
       .str("auth", o.proto.auth == s3rdma::AuthMode::SigV4 ? "sigv4" : "none")
       .num("slot_bytes", static_cast<long long>(o.slot_bytes)).num("slots", static_cast<long long>(o.slots))
