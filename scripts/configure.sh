@@ -13,20 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Configure the CMake build. Builds against the version-aligned cuObject SDK if
-# unpacked under third_party/ (or pointed to by CUOBJ_SDK_ROOT), else the system
-# install. See doc/test.md.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SDK="${CUOBJ_SDK_ROOT:-${ROOT}/third_party/cuobj-1.0.0/extract}"
+# shellcheck source=../third_party/versions.env
+. "${ROOT}/third_party/versions.env"
+SDK="${CUOBJ_SDK_ROOT:-${ROOT}/third_party/cuobj-${CUOBJ_VERSION}/extract}"
 
-ARG=()
+ARG=(-DS3RDMA_BUILD_SERVER="${S3RDMA_BUILD_SERVER:-ON}")
 if [ -d "${SDK}" ]; then
-  ARG=(-DCUOBJ_SDK_ROOT="$(realpath "${SDK}")")
+  ARG+=(-DCUOBJ_SDK_ROOT="$(realpath "${SDK}")")
   echo "configure: cuObject SDK root = ${SDK}"
 else
   echo "configure: using system cuObject (no SDK root at ${SDK})"
 fi
+echo "configure: server = ${S3RDMA_BUILD_SERVER:-ON}"
 
 cmake -S "${ROOT}" -B "${ROOT}/build" -G Ninja "${ARG[@]}"

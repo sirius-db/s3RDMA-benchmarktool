@@ -21,6 +21,7 @@
 
 #include <cstddef>
 #include <cstdio>
+#include <stdexcept>
 #include <string>
 
 #include <openssl/sha.h>
@@ -29,7 +30,8 @@ namespace s3rdma {
 
 inline std::string sha256_hex(const void* data, size_t len) {
   unsigned char digest[SHA256_DIGEST_LENGTH];
-  SHA256(static_cast<const unsigned char*>(data), len, digest);
+  if (SHA256(static_cast<const unsigned char*>(data), len, digest) == nullptr)
+    throw std::runtime_error("SHA256 failed");
   static const char* hex = "0123456789abcdef";
   std::string out;
   out.reserve(SHA256_DIGEST_LENGTH * 2);

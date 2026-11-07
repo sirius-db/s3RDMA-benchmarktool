@@ -46,60 +46,64 @@ message(STATUS "ibverbs: ${IBVERBS_LIB}")
 message(STATUS "rdmacm:  ${RDMACM_LIB}")
 
 # ---------------------------------------------------------------------------
-# cuObject SDK (system install). Client lib ships under the CUDA toolkit dir,
-# server lib under the system multiarch dir. Headers split across both.
-# See doc/design.md for the exact paths.
+# cuObject SDK. Client lib + cuobjclient.h ship under the CUDA toolkit target
+# dir (CUDA >= 13.1.1); the server lib + headers are a separate SDK under the
+# system multiarch dir. See doc/design.md for the exact paths.
 # ---------------------------------------------------------------------------
-# Optional: point at an unpacked cuObject SDK tree (e.g. an older version) to
-# build against instead of the system install. Set -DCUOBJ_SDK_ROOT=<prefix>
-# where <prefix> contains usr/include, usr/local/cuda-*/targets/.../{include,lib}
-# and usr/lib/x86_64-linux-gnu. See doc/test.md.
-set(CUOBJ_SDK_ROOT "" CACHE PATH "Optional unpacked cuObject SDK prefix")
+option(S3RDMA_BUILD_SERVER "Build the cuObjServer-based test server" ON)
+
+set(CUOBJ_SDK_ROOT "" CACHE PATH "Optional cuObject SDK prefix (package, CUDA root or staged dir)")
 
 set(CUOBJ_LIB_SUFFIXES lib lib/x86_64-linux-gnu)
 
 if(CUOBJ_SDK_ROOT)
-  # Pin everything to the unpacked SDK. NO_DEFAULT_PATH so the conda env's
-  # CMAKE_PREFIX_PATH (which also ships a libcuobjclient) cannot shadow it.
+  # NO_DEFAULT_PATH so the conda env's CMAKE_PREFIX_PATH (which also ships a
+  # libcuobjclient) cannot shadow the pinned tree.
   message(STATUS "Using cuObject SDK root: ${CUOBJ_SDK_ROOT}")
   file(GLOB _cuda_targets "${CUOBJ_SDK_ROOT}/usr/local/cuda-*/targets/x86_64-linux")
-  set(_sdk_hints ${_cuda_targets} ${CUOBJ_SDK_ROOT}/usr)
-  find_path(CUOBJCLIENT_INCLUDE_DIR cuobjclient.h
-            HINTS ${_sdk_hints} PATH_SUFFIXES include NO_DEFAULT_PATH REQUIRED)
-  find_library(CUOBJCLIENT_LIB cuobjclient HINTS ${_sdk_hints}
-               PATH_SUFFIXES ${CUOBJ_LIB_SUFFIXES} NO_DEFAULT_PATH REQUIRED)
-  find_path(CUOBJSERVER_INCLUDE_DIR cuobjserver.h
-            HINTS ${_sdk_hints} PATH_SUFFIXES include NO_DEFAULT_PATH REQUIRED)
-  find_library(CUOBJSERVER_LIB cuobjserver HINTS ${_sdk_hints}
-               PATH_SUFFIXES ${CUOBJ_LIB_SUFFIXES} NO_DEFAULT_PATH REQUIRED)
+  set(_sdk_hints ${_cuda_targets}
+      ${CUOBJ_SDK_ROOT}/targets/x86_64-linux
+      ${CUOBJ_SDK_ROOT}
+      ${CUOBJ_SDK_ROOT}/usr)
+  set(_sdk_find_opts NO_DEFAULT_PATH)
 else()
-  set(CUOBJ_HINTS
-      /usr/local/cuda-13.3/targets/x86_64-linux
+  file(GLOB _cuda_targets "/usr/local/cuda-*/targets/x86_64-linux")
+  set(_sdk_hints
+      ${CUDAToolkit_TARGET_DIR}
+      /usr/local/cuda/targets/x86_64-linux
+      ${_cuda_targets}
       /usr/lib/x86_64-linux-gnu
       /usr)
-  find_path(CUOBJCLIENT_INCLUDE_DIR cuobjclient.h
-            HINTS ${CUOBJ_HINTS} PATH_SUFFIXES include REQUIRED)
-  find_library(CUOBJCLIENT_LIB cuobjclient HINTS ${CUOBJ_HINTS}
-               PATH_SUFFIXES ${CUOBJ_LIB_SUFFIXES} REQUIRED)
-  find_path(CUOBJSERVER_INCLUDE_DIR cuobjserver.h
-            HINTS ${CUOBJ_HINTS} PATH_SUFFIXES include REQUIRED)
-  find_library(CUOBJSERVER_LIB cuobjserver HINTS ${CUOBJ_HINTS}
-               PATH_SUFFIXES ${CUOBJ_LIB_SUFFIXES} REQUIRED)
+  set(_sdk_find_opts)
 endif()
 
-message(STATUS "cuobjclient: ${CUOBJCLIENT_LIB} (hdr ${CUOBJCLIENT_INCLUDE_DIR})")
-message(STATUS "cuobjserver: ${CUOBJSERVER_LIB} (hdr ${CUOBJSERVER_INCLUDE_DIR})")
+find_path(CUOBJCLIENT_INCLUDE_DIR cuobjclient.h
+          HINTS ${_sdk_hints} PATH_SUFFIXES include ${_sdk_find_opts} REQUIRED)
+find_library(CUOBJCLIENT_LIB cuobjclient HINTS ${_sdk_hints}
+             PATH_SUFFIXES ${CUOBJ_LIB_SUFFIXES} ${_sdk_find_opts} REQUIRED)
+get_filename_component(_cuobjclient_real "${CUOBJCLIENT_LIB}" REALPATH)
+message(STATUS "cuobjclient: ${CUOBJCLIENT_LIB} -> ${_cuobjclient_real} (hdr ${CUOBJCLIENT_INCLUDE_DIR})")
 
-# The server headers live in /usr/include. Adding that whole directory to the
-# include path poisons the conda sysroot (host glibc headers shadow the
-# toolchain's). Instead stage symlinks to only the cuObject server headers into
-# a private dir and point the server target at that.
-set(CUOBJ_SERVER_STAGE_DIR ${CMAKE_BINARY_DIR}/cuobj_server_include)
-file(MAKE_DIRECTORY ${CUOBJ_SERVER_STAGE_DIR})
-foreach(_hdr cuobjserver.h cuobjrdma.h cuobjtelem.h)
-  file(CREATE_LINK ${CUOBJSERVER_INCLUDE_DIR}/${_hdr}
-       ${CUOBJ_SERVER_STAGE_DIR}/${_hdr} SYMBOLIC)
-endforeach()
+if(S3RDMA_BUILD_SERVER)
+  find_path(CUOBJSERVER_INCLUDE_DIR cuobjserver.h
+            HINTS ${_sdk_hints} PATH_SUFFIXES include ${_sdk_find_opts} REQUIRED)
+  find_library(CUOBJSERVER_LIB cuobjserver HINTS ${_sdk_hints}
+               PATH_SUFFIXES ${CUOBJ_LIB_SUFFIXES} ${_sdk_find_opts} REQUIRED)
+  message(STATUS "cuobjserver: ${CUOBJSERVER_LIB} (hdr ${CUOBJSERVER_INCLUDE_DIR})")
+
+  # The server headers live in /usr/include. Adding that whole directory to the
+  # include path poisons the conda sysroot (host glibc headers shadow the
+  # toolchain's). Instead stage symlinks to only the cuObject server headers into
+  # a private dir and point the server target at that.
+  set(CUOBJ_SERVER_STAGE_DIR ${CMAKE_BINARY_DIR}/cuobj_server_include)
+  file(MAKE_DIRECTORY ${CUOBJ_SERVER_STAGE_DIR})
+  foreach(_hdr cuobjserver.h cuobjrdma.h cuobjtelem.h)
+    file(CREATE_LINK ${CUOBJSERVER_INCLUDE_DIR}/${_hdr}
+         ${CUOBJ_SERVER_STAGE_DIR}/${_hdr} SYMBOLIC)
+  endforeach()
+else()
+  message(STATUS "cuobjserver: not built (S3RDMA_BUILD_SERVER=OFF)")
+endif()
 
 # ---------------------------------------------------------------------------
 # Shared header-only helpers (logging + error-check macros).
@@ -109,5 +113,7 @@ target_include_directories(s3rdma_common INTERFACE ${CMAKE_SOURCE_DIR}/common)
 target_link_libraries(s3rdma_common INTERFACE CUDA::cudart)
 
 add_subdirectory(client)
-add_subdirectory(server)
+if(S3RDMA_BUILD_SERVER)
+  add_subdirectory(server)
+endif()
 add_subdirectory(probe)

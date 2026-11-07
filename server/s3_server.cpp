@@ -237,10 +237,11 @@ int S3Server::handle_get(const std::string& key, const std::string& range_hdr,
     is_range = true;
   }
 
-  const std::string rdma_descr = base64_decode(rdma_token_b64);
-
-  // Extract the remote buffer base address from the RDMA descriptor.
-  uint64_t remote_base = parse_rdma_remote_addr(rdma_descr);
+  // A DC_V1 descriptor contains ':'; the Base64 wire form does not.
+  const std::string rdma_descr =
+      rdma_token_b64.find(':') != std::string::npos
+          ? rdma_token_b64 : base64_decode(rdma_token_b64);
+  const uint64_t remote_base = parse_rdma_remote_addr(rdma_descr);
   if (remote_base == 0) {
     LOG_ERROR("failed to parse remote address from RDMA descriptor");
     return 500;
@@ -371,7 +372,10 @@ void S3Server::run() {
                             bytes);
     res.status = status;
     if (status == 200 || status == 206) {
-      res.set_header(kHdrRdmaReply, "200");
+      res.set_header(kHdrRdmaReply,
+                     token.find(':') != std::string::npos
+                         ? std::to_string(status) : "200");
+      res.set_header(kHdrRdmaBytesTransferred, std::to_string(bytes));
       res.set_content("OK\n", "text/plain");
     } else {
       res.set_content("error\n", "text/plain");

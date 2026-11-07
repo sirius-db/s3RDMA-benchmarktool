@@ -35,9 +35,15 @@ sysroot_linux-64 = "2.17.*"
 cmake = ">=3.22"
 ninja = ">=1.11"
 pkg-config = ">=0.29"
-# CUDA headers/libs for building (match the cluster's CUDA major version).
-# Comment out if you prefer to use the system CUDA toolkit instead.
-cuda-toolkit = ">=13.0"
+# Keep the CUDA, cuObject and cuFile packages aligned: CUDA::cuFile is
+# selected independently of CUOBJ_SDK_ROOT.
+cuda-version = "13.4.*"
+cuda-nvcc = "13.4.*"
+cuda-cudart-dev = "13.4.*"
+libcuobjclient = "1.3.1.*"
+libcuobjclient-dev = "1.3.1.*"
+libcufile = ">=1.19.1.55,<1.20.0a0"
+libcufile-dev = ">=1.19.1.55,<1.20.0a0"
 # Header-only HTTP library for the fake S3 control path (server endpoint +
 # client HTTP call inside the cuObject get/put callback). See doc/design.md.
 cpp-httplib = ">=0.15"
@@ -57,9 +63,6 @@ rsync = ">=3.2"
 # once before `configure`/`build` unless you use a system cuObject install or set
 # CUOBJ_SDK_ROOT. See third_party/README.md.
 fetch-sdk = "bash scripts/fetch_sdk.sh"
-# Configure the build (out-of-source in ./build). Builds against the
-# version-aligned cuObject 1.0.0 SDK if unpacked under third_party/ (run
-# `pixi run fetch-sdk`, or set CUOBJ_SDK_ROOT), else the system install. See doc/test.md.
 configure = "bash scripts/configure.sh"
 # Compile everything
 build = { cmd = "cmake --build build", depends-on = ["configure"] }

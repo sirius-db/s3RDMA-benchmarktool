@@ -18,8 +18,7 @@ developer program, so — like the [`sirius`](https://github.com/sirius-db/siriu
 repo — they are version-pinned and fetched at build time into the git-ignored
 `third_party/` cache.
 
-Versions are pinned in [`third_party/versions.env`](third_party/versions.env)
-(cuObject 1.0.0 + cuFile 1.16). Provide them one of two ways:
+SDK staging defaults are in [`third_party/versions.env`](third_party/versions.env): cuObject client 1.3.1 and a `cufile-1.19` staging directory. Use matching CUDA/cuFile artifacts as described in [doc/test.md](doc/test.md). Provide cuObject one of two ways:
 
 ```bash
 # 1. Fetch: set the gated download URLs, then pull into third_party/
@@ -40,9 +39,9 @@ export PATH="$HOME/.pixi/bin:$PATH"
 pixi run fetch-sdk  # download the pinned cuObject/cuFile SDKs (see above)
 pixi run build      # configure + compile client/server
 pixi run gen-data   # create test objects under data/demo-bucket/
-pixi run bundle     # self-contained dist/{server,client} bundles
-pixi run deploy     # rsync bundles to the RDMA nodes (set *_HOST/*_USER/... env)
 ```
+
+The cuObject 1.3.1 profile is built and run in place. The deployment scripts still target the earlier cuObject 1.0.0 / cuFile 1.16 profile; bundle and deploy support for the new profile is pending.
 
 The RDMA data path requires a Mellanox NIC; hosts without one are build/link only.
 

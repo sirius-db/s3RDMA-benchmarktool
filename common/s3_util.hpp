@@ -26,8 +26,11 @@ namespace s3rdma {
 // HTTP header names exchanged on the control path (see doc/design.md).
 // Only standard cuObject headers are used — see
 // https://docs.nvidia.com/gpudirect-storage/cuobject/index.html
-inline constexpr const char* kHdrRdmaToken = "x-amz-rdma-token";   // base64 desc_str
+// The token value is the descriptor string itself on a standard gateway; the
+// shipped fake-S3 pair base64-encodes it (s3_protocol.hpp selects which).
+inline constexpr const char* kHdrRdmaToken = "x-amz-rdma-token";
 inline constexpr const char* kHdrRdmaReply = "x-amz-rdma-reply";   // RDMA status ("200" = OK)
+inline constexpr const char* kHdrRdmaBytesTransferred = "x-amz-rdma-bytes-transferred";
 
 // Parse the remote buffer base address from a decoded RDMA descriptor.
 // DC_V1 format: "buf_address:buf_size:rkey:lid:dctn:rocev2_flag:gid"
